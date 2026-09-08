@@ -69,7 +69,17 @@ func BuildServiceGraph(ctx context.Context, conn driver.Conn, window time.Durati
 	}
 	defer rows.Close()
 
-	g := &ServiceGraph{Criticality: map[string]float64{}, CutVertices: map[string]bool{}}
+	// Nodes/Edges/Cycles start as empty (not nil) slices for the same reason
+	// as internal/query.Result.Rows: a nil slice marshals to JSON `null`,
+	// and "no cross-service traffic in this window" is a normal, common
+	// result the UI must be able to iterate without a null check.
+	g := &ServiceGraph{
+		Nodes:       []string{},
+		Edges:       []ServiceEdgeStat{},
+		Cycles:      [][]string{},
+		Criticality: map[string]float64{},
+		CutVertices: map[string]bool{},
+	}
 	nodeSet := map[string]bool{}
 	directed := map[string][]string{}
 	undirected := map[string]map[string]bool{}
@@ -158,7 +168,7 @@ func findCycles(nodes []string, adjacency map[string][]string) [][]string {
 	)
 	color := map[string]int{}
 	var path []string
-	var cycles [][]string
+	cycles := [][]string{}
 
 	var visit func(u string)
 	visit = func(u string) {

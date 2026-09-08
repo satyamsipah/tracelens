@@ -115,6 +115,14 @@ func decodeTraceID(id string) ([]byte, error) {
 	return b, nil
 }
 
+// idColumns are the raw-byte id columns (FixedString(16)/(8) in ClickHouse,
+// Go string via ScanType) that must never reach JSON as their raw bytes:
+// json.Marshal replaces invalid UTF-8 with U+FFFD, silently corrupting a
+// trace_id/span_id a caller (the UI's jump-to-trace link, above all) needs
+// byte-exact. Hex-encoded here, once, at the JSON boundary, rather than
+// requiring every caller to remember to do it.
+var idColumns = map[string]bool{"trace_id": true, "span_id": true, "parent_span_id": true}
+
 // scanRows drains a result set generically -- Execute serves arbitrary
 // aggregations and raw column lists, so the column set isn't known until
 // query time. ColumnType.ScanType gives the exact Go type ClickHouse would
@@ -123,7 +131,12 @@ func decodeTraceID(id string) ([]byte, error) {
 func scanRows(rows driver.Rows) (*Result, error) {
 	cols := rows.Columns()
 	types := rows.ColumnTypes()
-	result := &Result{Columns: cols}
+	// Rows starts as an empty (not nil) slice: a Go nil slice marshals to
+	// JSON `null`, and a zero-row aggregate (a real, common case -- "no
+	// matching group") would otherwise hand every API consumer a `null`
+	// where they reasonably expect an iterable array. Caught by the query
+	// explorer UI crashing outright on an empty result.
+	result := &Result{Columns: cols, Rows: [][]any{}}
 
 	for rows.Next() {
 		dest := make([]any, len(types))
@@ -135,7 +148,13 @@ func scanRows(rows driver.Rows) (*Result, error) {
 		}
 		row := make([]any, len(dest))
 		for i, d := range dest {
-			row[i] = reflect.ValueOf(d).Elem().Interface()
+			v := reflect.ValueOf(d).Elem().Interface()
+			if idColumns[cols[i]] {
+				if s, ok := v.(string); ok {
+					v = hex.EncodeToString([]byte(s))
+				}
+			}
+			row[i] = v
 		}
 		result.Rows = append(result.Rows, row)
 	}
