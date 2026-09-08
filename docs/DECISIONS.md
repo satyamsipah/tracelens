@@ -142,6 +142,46 @@ humans, where zeros are visibly zeros rather than silently aggregated away.
 
 ---
 
+### 3a. `@storage-reviewer` findings against ~900K live spans, and what was fixed
+
+A general-purpose agent ran the storage-reviewer checklist against the
+running stack after it had processed real demo traffic plus loadgen runs
+(887,710 → 905,166 spans across two passes). Findings, ranked, with
+independent verification before any fix was applied (see below for why that
+mattered):
+
+| # | Finding | Measured | Action |
+|---|---|---|---|
+| 1 | `idx_duration` minmax prunes **zero** granules | `EXPLAIN indexes=1` on `service_name='gateway' AND duration_ns>200000000`: `Skip idx_duration Granules: 38/38` — every granule surviving the primary-key filter also survives the minmax check | **Fixed.** Dropped in migration 0005. Confirms exactly what was flagged as suspect when the index was added (§5 above) |
+| 2 | `span_id CODEC(ZSTD(1))` **inflates** the column | `system.columns`: raw 7,111,792 B → compressed 7,115,186 B (ratio 0.9995, i.e. *larger* after compression) | **Fixed.** Changed to `CODEC(NONE)` in migration 0005, along with `links.span_id` (identical shape, fixed ahead of having its own data to measure, on structural grounds) |
+| 3 | ORDER BY costs ~4.2× read amplification for the RED-metrics query shape (service+time, no span_name filter) | `EXPLAIN ESTIMATE`: ground truth 6,265 matching rows, 26,236 rows read | **Not acted on.** A real trade-off, not a bug — swapping `span_name` and `timestamp` in the key would move the identical cost onto the service-map query shape instead. Needs a real QPS split between the two patterns to decide, which phase 1 does not have |
+| 4–5 | `idx_trace_id` and `idx_attr_keys` bloom filters both prune real work (89.7% and 49% of granules respectively, confirmed via `SET use_skip_indexes=0/1`) | — | No change — validated as earning their keep |
+| 6 | 6–7 active parts for <900K rows in one partition | `EXPLAIN` shows `Parts: 6/6` | Not a DDL issue — background merges lagging insert rate under sustained loadgen pressure. Self-resolves; not acted on |
+| 7 | `logs`/`metrics` had 0 rows at review time | — | Indexes on those tables are validated only statically; re-review once log/metric ingestion carries real traffic |
+
+**Why finding #2 was verified independently before acting on it, and it was
+the right call:** the agent's report cited non-zero `system.columns` byte
+values, but an earlier compression test in this same session had found those
+columns reporting **zero** on a single-row sample. Re-querying directly
+confirmed the columns populate correctly once the table holds real volume —
+the zero was a small-sample artifact, not a permanent build limitation, and
+the finding itself held up exactly as reported. The general policy stands
+regardless of outcome: verify an agent's cited numbers against the live system
+before changing schema on their word, especially when a prior measurement in
+the same session appears to contradict them.
+
+**Why this is migration 0005, not an edit to 0002:** 0002 was already applied
+against the running instance, and its ledger entry exists. Editing that file's
+`CREATE TABLE` in place would silently diverge a fresh install (which reads
+the edited file) from the already-migrated instance (whose `IF NOT EXISTS`
+skips re-running it) — the exact kind of silent divergence this log exists to
+prevent. `0002`'s inline comments were updated to point at 0005 for a future
+reader, since comment text carries no schema semantics and isn't re-executed.
+
+Post-fix compression: 905,166 spans, 143.72 MiB → 35.97 MiB, **4.0× overall**.
+
+---
+
 ### 4. Sort keys
 
 | Table | `ORDER BY` | `PRIMARY KEY` |
@@ -180,12 +220,12 @@ categorical, not ordinal-ranged.
 - **`set(24)` on `severity_number`** — see above.
 - **`bloom_filter` on `mapKeys(span_attributes)`** — serves "spans that *have*
   attribute k" without decompressing the map value stream.
-- **`minmax` on `duration_ns` — flagged as probably not earning its keep.**
-  `ORDER BY` does not correlate with duration, so every granule likely holds a
-  near-full duration range and this prunes almost nothing. It is kept only to
-  be measured with `EXPLAIN indexes=1`; the honest expectation is that it gets
-  dropped. The real pruning for "slow spans" comes from the service+time
-  prefix. Recorded here so the decision to remove it is already justified.
+- **`minmax` on `duration_ns` — flagged as probably not earning its keep, then
+  measured and removed.** `ORDER BY` does not correlate with duration, so
+  every granule holds a near-full duration range. `EXPLAIN indexes=1` on a
+  live "slow spans for service X" query confirmed 0 of 38 granules pruned.
+  Dropped in migration 0005 (§3a). The real pruning for that query comes from
+  the service+time prefix, as originally predicted.
 
 ---
 

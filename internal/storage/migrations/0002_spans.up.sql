@@ -21,6 +21,12 @@ CREATE TABLE IF NOT EXISTS tracelens.spans
     -- alone, and only because the N spans of one trace arrive in one batch and
     -- therefore repeat within a granule.
     trace_id             FixedString(16) CODEC(ZSTD(1)),
+    -- CODEC(ZSTD(1)) here is HISTORICAL and corrected by migration 0005 to
+    -- CODEC(NONE): unlike trace_id, span_id has no cross-row repetition to
+    -- exploit (it is unique per row by construction), so ZSTD measured as
+    -- INFLATING it (compressed bytes > raw bytes) rather than shrinking it.
+    -- Left as originally written here per migration-file convention --
+    -- applied history is not rewritten — see 0005 and docs/DECISIONS.md.
     span_id              FixedString(8)  CODEC(ZSTD(1)),
     -- Root spans carry 8 zero bytes. That is the only structure in this column.
     parent_span_id       FixedString(8)  CODEC(ZSTD(1)),
@@ -85,13 +91,11 @@ CREATE TABLE IF NOT EXISTS tracelens.spans
     -- costs roughly 10KB per granule -- the one index here worth real bytes.
     INDEX idx_trace_id  trace_id TYPE bloom_filter(0.01) GRANULARITY 1,
 
-    -- Serves: "spans slower than X". CAVEAT, stated up front: ORDER BY does
-    -- not correlate with duration, so each granule holds a near-full range of
-    -- durations and this may prune almost nothing. Kept only while we measure
-    -- with EXPLAIN indexes=1; if it does not earn its keep, drop it rather
-    -- than cargo-cult it. Real pruning for that query comes from the
-    -- service+time prefix.
-    INDEX idx_duration  duration_ns TYPE minmax GRANULARITY 4,
+    -- idx_duration was HERE and is REMOVED by migration 0005: measured with
+    -- EXPLAIN indexes=1 to prune 0 of 38 granules, confirming the suspicion
+    -- recorded at the time it was added -- ORDER BY does not correlate with
+    -- duration_ns, so it earns nothing and only costs write-side CPU. Real
+    -- pruning for "slow spans" comes from the service+time prefix.
 
     -- Serves: "spans that HAVE attribute k" (e.g. http.status_code) without
     -- decompressing the map value stream.

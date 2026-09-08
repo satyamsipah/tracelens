@@ -128,7 +128,8 @@ The codec choices are not decoration — each is tied to the data's shape:
 | Column kind | Codec | Why |
 |---|---|---|
 | `timestamp` | `DoubleDelta, ZSTD(1)` | Sorted within a granule, so deltas are tiny |
-| `trace_id`, `span_id` | `ZSTD(1)` | CSPRNG output; Delta/T64 would *inflate* it |
+| `trace_id` | `ZSTD(1)` | CSPRNG output, but repeats across one trace's spans within a batch — measured 1.23× |
+| `span_id` | `NONE` | CSPRNG output with **no** cross-row repetition — ZSTD measured *inflating* it (0.9995×), so compression is off entirely |
 | `duration_ns` | `T64, ZSTD(1)` | Not monotonic, so Delta is noise; T64 crops provably-unused high bits |
 | `service_name`, `span_name` | `LowCardinality + ZSTD(1)` | Dictionary-encoded, leading sort key |
 | `span_kind`, `status_code` | `Enum8, ZSTD(1)` | Closed sets; 1 byte and garbage is rejected at insert |
@@ -141,8 +142,11 @@ later, so both cheap inserts and dense cold storage are possible.
 A test asserts that **no column lacks a codec** — a column added later without
 one fails CI rather than review.
 
-**Measured:** 50,963 spans from live demo + loadgen traffic compress
-9.14 MiB → 1.84 MiB, a **4.97× ratio at ~38 bytes per span** (`make compression`).
+**Measured:** 905,166 spans from live demo + loadgen traffic compress
+143.72 MiB → 35.97 MiB, a **4.0× ratio** (`make compression`). An
+independent schema review against this same live data found and fixed two
+issues: an index that pruned zero granules, and a codec that was quietly
+*inflating* its column — see [docs/DECISIONS.md §3a](docs/DECISIONS.md).
 
 ---
 
@@ -215,9 +219,11 @@ These are deliberate and recorded in [docs/DECISIONS.md](docs/DECISIONS.md):
   spec). A JSON request gets `415` rather than a silent misparse.
 - **`sampling_weight` is always 1**, since nothing samples yet. The column
   exists now so no aggregate needs rewriting when it stops being 1.
-- **`minmax` on `duration_ns` may not earn its keep** — the sort key does not
-  correlate with duration. Instrumented for measurement, to be dropped if
-  `EXPLAIN indexes=1` shows it pruning nothing.
+- **The `spans` ORDER BY costs ~4.2× read amplification on a service+time
+  query with no `span_name` filter** (measured via `EXPLAIN ESTIMATE`).
+  Swapping `span_name` and `timestamp` in the key would move the identical
+  cost onto service-map queries instead — left as-is pending a real query-mix
+  measurement to decide which pattern is higher QPS.
 
 ## Roadmap
 
