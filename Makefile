@@ -41,14 +41,18 @@ test-race: ## Run the full suite under the race detector, with containers
 bench: ## Run hot-path benchmarks with allocation counts
 	$(GO) test -run '^$$' -bench . -benchmem ./internal/ingest/...
 
+# golangci-lint embeds go/types, so a binary built by an older toolchain
+# cannot read a newer one's export data and reports the whole repo as
+# typecheck errors. Install it with the SAME Go that compiles the code:
+#   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 .PHONY: lint
-lint: ## Run golangci-lint (and gofmt as a fallback if it is absent)
+lint: ## Run gofmt, vet, and golangci-lint if it is installed
+	@test -z "$$(gofmt -l ./cmd ./demo ./internal)" || { echo "not gofmt-clean:"; gofmt -l ./cmd ./demo ./internal; exit 1; }
+	$(GO) vet ./...
 	@if command -v golangci-lint >/dev/null 2>&1; then \
-		golangci-lint run ./...; \
+		golangci-lint run --timeout=5m ./...; \
 	else \
-		echo "golangci-lint not installed; running gofmt + vet instead"; \
-		test -z "$$(gofmt -l ./cmd ./demo ./internal)" || { gofmt -l ./cmd ./demo ./internal; exit 1; }; \
-		$(GO) vet ./...; \
+		echo "golangci-lint not installed; gofmt and vet passed"; \
 	fi
 
 .PHONY: migrate

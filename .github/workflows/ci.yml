@@ -51,10 +51,17 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.62
-          args: --timeout=5m
+      # Installed with `go install` rather than the prebuilt action binary, on
+      # purpose: golangci-lint embeds go/types, and a binary built by an older
+      # toolchain cannot read a newer one's export data -- it fails with
+      # "export data version N is greater than maximum supported version M"
+      # and reports the whole repo as typecheck errors. Building it with the
+      # same Go that compiles the code makes that mismatch impossible.
+      - name: install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+
+      - name: golangci-lint
+        run: golangci-lint run --timeout=5m ./...
 
   test:
     name: race tests with testcontainers

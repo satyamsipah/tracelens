@@ -195,7 +195,10 @@ func (h *httpHandler) readBody(req *http.Request) ([]byte, error) {
 	case "", "identity":
 		reader = limited
 	case "gzip":
-		zr := gzipReaderPool.Get().(*gzip.Reader)
+		zr, ok := gzipReaderPool.Get().(*gzip.Reader)
+		if !ok {
+			zr = new(gzip.Reader)
+		}
 		if err := zr.Reset(limited); err != nil {
 			gzipReaderPool.Put(zr)
 			return nil, fmt.Errorf("gzip reset: %w", err)
@@ -232,8 +235,7 @@ var gzipReaderPool = sync.Pool{
 var zstdDecoderPool = sync.Pool{}
 
 func getZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
-	if v := zstdDecoderPool.Get(); v != nil {
-		dec := v.(*zstd.Decoder)
+	if dec, ok := zstdDecoderPool.Get().(*zstd.Decoder); ok {
 		if err := dec.Reset(r); err != nil {
 			return nil, err
 		}

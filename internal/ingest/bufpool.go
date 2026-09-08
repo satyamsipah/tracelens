@@ -14,7 +14,10 @@ var envelopeBufPool = sync.Pool{
 }
 
 func envelopeBufGet() []*Envelope {
-	return (*(envelopeBufPool.Get().(*[]*Envelope)))[:0]
+	if b, ok := envelopeBufPool.Get().(*[]*Envelope); ok {
+		return (*b)[:0]
+	}
+	return make([]*Envelope, 0, 64)
 }
 
 func envelopeBufPut(b []*Envelope) {

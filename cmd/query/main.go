@@ -21,18 +21,23 @@ import (
 
 func main() {
 	log := observability.NewLogger("query")
+	// os.Exit skips deferred functions, so all cleanup lives in run().
+	if err := run(log); err != nil {
+		log.Error("query exited", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+}
 
+func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg := config.LoadClickHouse()
 	metrics := observability.NewMetrics()
 	admin := observability.NewAdminServer(os.Getenv("TRACELENS_ADMIN_ADDR"), metrics)
 
-	conn, err := storage.WaitForClickHouse(ctx, cfg, 2*time.Minute)
+	conn, err := storage.WaitForClickHouse(ctx, config.LoadClickHouse(), 2*time.Minute)
 	if err != nil {
-		log.Error("clickhouse unavailable", slog.String("error", err.Error()))
-		os.Exit(1)
+		return err
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -48,5 +53,5 @@ func main() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = admin.Shutdown(shutdownCtx)
+	return admin.Shutdown(shutdownCtx)
 }

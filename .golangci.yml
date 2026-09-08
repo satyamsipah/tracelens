@@ -1,31 +1,22 @@
-run:
-  timeout: 5m
+# golangci-lint v2 config. v1 does not support Go 1.25, which go.mod requires
+# via golang.org/x/sync and genproto/googleapis/rpc.
+version: "2"
 
 linters:
+  # errcheck, govet, ineffassign, staticcheck and unused are on by default.
   enable:
-    - errcheck
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
     - bodyclose
     - errorlint
+    - gocritic
     - misspell
     - unconvert
-    - gocritic
 
-linters-settings:
-  errcheck:
-    # Deferred Close on a read-only handle is the one place where ignoring an
-    # error is genuinely correct rather than lazy.
-    check-type-assertions: true
-  gocritic:
-    disabled-checks:
-      - hugeParam # row structs are passed by value deliberately in tests
-
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gocritic
+  settings:
+    errcheck:
+      check-type-assertions: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic

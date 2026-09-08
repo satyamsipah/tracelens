@@ -64,7 +64,10 @@ var envelopePool = sync.Pool{
 }
 
 func newEnvelope(signal config.Signal) *Envelope {
-	e := envelopePool.Get().(*Envelope)
+	e, ok := envelopePool.Get().(*Envelope)
+	if !ok {
+		e = &Envelope{}
+	}
 	e.Signal = signal
 	e.key = e.key[:0]
 	e.payload = e.payload[:0]

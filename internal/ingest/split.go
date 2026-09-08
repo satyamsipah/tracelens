@@ -66,26 +66,34 @@ type Splitter struct {
 	mtData  *metricspb.MetricsData
 }
 
+func newSplitter() *Splitter {
+	return &Splitter{
+		traceIdx: make(map[[16]byte]int, 64),
+		logIdx:   make(map[string]int, 64),
+		trScope:  &tracepb.ScopeSpans{},
+		trRes:    &tracepb.ResourceSpans{},
+		trData:   &tracepb.TracesData{},
+		lgScope:  &logspb.ScopeLogs{},
+		lgRes:    &logspb.ResourceLogs{},
+		lgData:   &logspb.LogsData{},
+		mtScope:  &metricspb.ScopeMetrics{},
+		mtRes:    &metricspb.ResourceMetrics{},
+		mtData:   &metricspb.MetricsData{},
+	}
+}
+
 var splitterPool = sync.Pool{
-	New: func() any {
-		return &Splitter{
-			traceIdx: make(map[[16]byte]int, 64),
-			logIdx:   make(map[string]int, 64),
-			trScope:  &tracepb.ScopeSpans{},
-			trRes:    &tracepb.ResourceSpans{},
-			trData:   &tracepb.TracesData{},
-			lgScope:  &logspb.ScopeLogs{},
-			lgRes:    &logspb.ResourceLogs{},
-			lgData:   &logspb.LogsData{},
-			mtScope:  &metricspb.ScopeMetrics{},
-			mtRes:    &metricspb.ResourceMetrics{},
-			mtData:   &metricspb.MetricsData{},
-		}
-	},
+	New: func() any { return newSplitter() },
 }
 
 // GetSplitter takes a splitter from the pool.
-func GetSplitter() *Splitter { return splitterPool.Get().(*Splitter) }
+func GetSplitter() *Splitter {
+	s, ok := splitterPool.Get().(*Splitter)
+	if !ok {
+		s = newSplitter()
+	}
+	return s
+}
 
 // Release returns the splitter to the pool.
 func (s *Splitter) Release() {

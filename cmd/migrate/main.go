@@ -18,22 +18,23 @@ import (
 
 func main() {
 	log := observability.NewLogger("migrate")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	cfg := config.LoadClickHouse()
-
-	conn, err := storage.WaitForClickHouse(ctx, cfg, 2*time.Minute)
-	if err != nil {
-		log.Error("clickhouse unavailable", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-	defer func() { _ = conn.Close() }()
-
-	if err := storage.Migrate(ctx, conn, log); err != nil {
+	// os.Exit skips deferred functions, so all cleanup lives in run().
+	if err := run(log); err != nil {
 		log.Error("migration failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 	log.Info("schema up to date")
+}
+
+func run(log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	conn, err := storage.WaitForClickHouse(ctx, config.LoadClickHouse(), 2*time.Minute)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	return storage.Migrate(ctx, conn, log)
 }
