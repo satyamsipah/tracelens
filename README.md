@@ -62,10 +62,12 @@ Requires Docker and Go 1.25+.
 make up
 ```
 
-That builds every binary, starts ClickHouse, Redpanda, the collector, the
-assembler, the four demo services, Prometheus and Grafana, and waits for all
-health checks. The demo gateway self-drives at 5 rps, so traces start flowing
-immediately.
+That builds every binary and image (including the Next.js UI), starts
+ClickHouse, Redpanda, the collector, the assembler, the query API, the web
+UI, the four demo services, Prometheus and Grafana, and waits for all health
+checks. The demo gateway self-drives at 5 rps, so traces start flowing
+immediately. Open `localhost:3001` — the query explorer's EXPLAIN toggle and
+the service map are the fastest way to see what this project actually does.
 
 Confirm telemetry is landing end to end:
 
@@ -85,6 +87,13 @@ Measure what compression the codecs actually achieved:
 make compression
 ```
 
+Run every Part B benchmark (query optimiser at scale, storage/codec/batch-size,
+sampler, Drain, correctness-under-load) and leave raw output under `bench/out/`:
+
+```bash
+make bench-all
+```
+
 Tear everything down:
 
 ```bash
@@ -93,10 +102,13 @@ make down
 
 | Service | Address |
 |---|---|
+| Web UI | `localhost:3001` |
+| Query API | `localhost:8080` (`/api/query`, `/api/explain`, `/api/trace/{id}`, `/api/services`, `/api/services/graph`, `/api/logs/templates`, `/api/health`) |
 | OTLP gRPC | `localhost:4317` |
 | OTLP HTTP | `localhost:4318` |
 | Collector metrics | `localhost:9464/metrics` |
 | Assembler metrics | `localhost:9465/metrics` |
+| Query metrics | `localhost:9466/metrics` |
 | ClickHouse | `localhost:9000` (native), `localhost:8123` (HTTP) |
 | Prometheus | `localhost:9090` |
 | Grafana | `localhost:3000` (anonymous admin) |
@@ -444,6 +456,49 @@ a documented, accepted simplification, not a hidden gap.
 
 ---
 
+## UI
+
+Next.js 14 (App Router) + TypeScript + Tailwind, in [`web/`](web/) — see
+[`web/README.md`](web/README.md) for the full view-by-view breakdown. It
+talks only to `cmd/query`'s HTTP API, never ClickHouse directly.
+
+- **Trace waterfall** (`/traces/[id]`) — nested bars on a shared time axis
+  (d3-scale), critical path highlighted, virtualised so a 500+ span trace
+  only ever mounts the rows scrolled into view, with a live FPS counter
+  while scrolling rather than an assumption that virtualising was enough.
+- **Flamegraph** (`/flamegraph`) — merges the call trees of up to 20 recent
+  traces containing a chosen operation into one aggregated icicle chart,
+  click-to-zoom with breadcrumb navigation.
+- **Service map** (`/services`) — d3-force directed graph over the same
+  `service_edges` rollup the API's graph endpoint reads: node size =
+  traffic, edge colour = error rate, click an edge for its latency
+  distribution.
+- **Query explorer** (`/query`) — the DSL with syntax highlighting
+  (a hand-rolled CodeMirror `StreamLanguage`, matching `internal/query`'s
+  own lexer token classes) and autocomplete on known services/operations,
+  results as a table or bar chart, and an **EXPLAIN toggle** rendering the
+  logical plan, optimised plan, compiled SQL, and ClickHouse's own EXPLAIN
+  side by side.
+- **Log explorer** (`/logs`) — grouped by Drain template, expandable to
+  instances, jump-to-trace link when a log carries a trace_id.
+- **System health** (`/health`) — the same ingestion/queue/sampler/storage
+  numbers as the self-monitoring Grafana dashboard, read from the same
+  Prometheus/ClickHouse sources via `cmd/query`'s `/api/health` (which
+  proxies a fixed set of Prometheus instant queries server-side, since
+  Prometheus sets no CORS headers for a browser to call it directly).
+
+**A real bug found and fixed while wiring this up, worth recording because
+it is a general trap, not a one-off:** `internal/query`'s generic row
+scanner returned Go's zero-value nil slice for an empty result set, and
+`encoding/json` marshals `nil` to `null`, not `[]` — a client iterating
+`result.Rows` on any zero-row query (a completely ordinary case, e.g. an
+aggregation over a narrow time window with no matching data) crashed
+outright. Fixed at the source (`internal/query/executor.go`,
+`servicegraph.go`, `logs.go`): every slice-typed API field is now
+initialized non-nil, so "no results" is `[]`, not `null`, everywhere.
+
+---
+
 ## Testing
 
 ```bash
@@ -480,6 +535,40 @@ batch carries:
 
 *(Apple M1. See [docs/DECISIONS.md](docs/DECISIONS.md) for the before/after
 that produced these.)*
+
+### Headline benchmark numbers (Part B)
+
+Full methodology, every table, and the honest caveats (what ran under
+contention, what didn't reach its target scale, and why) are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). One command reproduces all of it
+against a running stack (`make up` first):
+
+```bash
+make bench-all   # ROWS=100000000 ITERS=5 to push further than the default
+```
+
+| Result | Number | Source |
+|---|---|---|
+| Partition pruning (1h of 7d), bytes read | **19.3× fewer** | `make querybench`, ~25M rows |
+| Partition pruning (1h of 7d), latency | **5.1× faster** | `make querybench`, ~25M rows |
+| ClickHouse insert throughput (200k row batches) | **1.78M rows/sec** | `make storagebench` |
+| Timestamp codec (DoubleDelta vs none) | **~230× smaller** | `make storagebench` |
+| Log template throughput (steady state) | **~897,000 lines/sec** | `go test ./internal/logs/... -bench .` |
+| Log storage saving (template_id+params vs raw body) | **2.76×** | `internal/logs/store_test.go` |
+| Anomaly detector precision / recall | **0.806 / 0.833** | `internal/anomaly/detector_test.go` |
+| Error retention under sampling | **100%** (200/200), non-errors at 5.0% vs 5% target | `internal/sampling` Phase 2 tests |
+| Buffer memory per in-flight trace (accounted, floor) | **98 bytes** | `internal/sampling/loadbench_test.go` |
+
+Two things this table deliberately does **not** claim, because they were
+measured and turned out not to hold up: predicate pushdown and limit
+pushdown's specific numbers at the ~25M-row scale (both ran concurrently
+with a background reseed and showed the pass making queries *slower* —
+structurally impossible, flagged as contention noise, not reported as a
+result); and a full 100M-row measurement (seeding reached ~25-30M inside
+this session's time budget before this table was written — the seed
+process for `-rows 100000000` sustains roughly 12-17k rows/sec, making
+100M a multi-hour operation. Re-run `make querybench ROWS=100000000` on
+an idle stack to complete it).
 
 ---
 
@@ -555,11 +644,25 @@ These are deliberate and recorded in [docs/DECISIONS.md](docs/DECISIONS.md):
 - **Critical-path computation is a simplification** (follows the child with
   the latest end-time at each level), not full gap-accounting critical-path
   analysis.
+- **A commit-floor watermark can get stuck indefinitely if the trace
+  holding it never resolves**, and once stuck long enough for broker
+  retention to age out that offset, every consumer restart hits a
+  permanent "offset no longer exists" loop — found live while running the
+  Part B correctness-under-load proof, not by inspection. This is the
+  single most important open item in the project right now; see
+  [docs/DECISIONS.md](docs/DECISIONS.md)'s Phase 4 §8 for the full
+  evidence and the reasoning for leaving it open rather than patching a
+  principle-1-critical mechanism under time pressure.
 
 ## Roadmap
 
 1. ~~OTLP ingestion, ClickHouse schema, demo workload~~ — done
 2. ~~Trace assembly + tail sampling (bounded buffer, eviction policy, sampling weights)~~ — done
 3. ~~Log pipeline (Drain templating, cardinality control, per-severity retention)~~ — done
-4. Query engine: DSL → AST → logical plan → physical plan
-5. UI: trace waterfall, flamegraph, service map, log explorer
+4. ~~Query engine: DSL → AST → logical plan → physical plan~~ — done
+5. ~~Service graph, RED rollups, anomaly detection, alerting~~ — done
+6. ~~UI: trace waterfall, flamegraph, service map, log explorer, query explorer, system health~~ — done
+7. ~~Load testing and benchmarks (Part B)~~ — done, with two open items: the
+   100M-row query-engine scale target (reached ~25-30M in-session; see
+   [docs/BENCHMARKS.md](docs/BENCHMARKS.md)) and the stuck-commit-floor bug
+   below

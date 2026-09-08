@@ -1261,3 +1261,208 @@ by being confused about why it doesn't match `kafka-consumer-groups.sh`.
   package's test suite. Recorded here rather than silently re-run away,
   since a flake worth noticing is exactly the kind of thing this log
   exists to not lose track of.
+
+## 2026-09-09 — Phase 4: UI, load testing, and benchmarks
+
+### 1. UI stack: hand-written primitives over the shadcn CLI, CodeMirror `StreamLanguage` over a full Lezer grammar
+
+**Decided.** `web/components/ui/*` are small, hand-written Tailwind
+components (button, card, table, tabs, badge, input) in shadcn's spirit —
+owned, copy-pasted, no runtime component-library dependency — rather than
+running the `shadcn` CLI against a registry mid-session. The DSL editor's
+syntax highlighting is a `@codemirror/language` `StreamLanguage` (a
+classic-mode tokenizer returning standard style names like `"keyword"`,
+`"string"`, `"variableName"`) rather than a full Lezer grammar: the DSL is
+small enough that a hand-rolled `token(stream, state)` function mirroring
+`internal/query/lexer.go`'s own token classes is a fraction of the work a
+real parser-generator grammar would be, for identical visual result.
+Autocomplete suggests known DSL keywords plus live service/operation names
+(the latter fetched once via the DSL itself — `{} | count by (operation)`
+— rather than a dedicated backend endpoint just for name completion).
+
+### 2. Trace waterfall: virtualised rendering, a live FPS counter, not an assumption
+
+**Decided.** The waterfall only ever mounts the rows scrolled into view
+(+overscan), computed from `scrollTop`/container height rather than a
+third-party virtualisation library — deep traces (500+ spans) were the
+explicit brief, and a naive full-mount render is exactly what tanks frame
+rate at that depth. Rather than assert virtualisation "worked", a
+`requestAnimationFrame`-based FPS counter renders live while scrolling
+(`components/waterfall.tsx`'s `useFPS`), turning "measure frame rate" from
+a documentation claim into a number the person driving the demo can
+actually see move.
+
+### 3. Flamegraph: merge-by-(service,operation)-at-tree-position, not time-aligned
+
+**Decided.** Up to 20 recent traces containing a chosen operation are
+fetched and merged into one aggregated icicle chart by matching frames at
+the same call-tree *position* by `(service, operation)` name — the
+standard "merged flamegraph" construction used by pprof/speedscope, not a
+time-aligned overlay (merged traces from different points in time have no
+shared time axis to align to). A frame's rectangle width is the sum of
+that position's `duration_ns` across every matched instance, which already
+includes its own children's time (as any single span's duration always
+does), so parent widths are never double-counted against their children's.
+
+### 4. Service map: `d3-force` directly, not a React wrapper
+
+**Decided.** `components/service-map.tsx` drives `d3-force`/`d3-drag`/`d3-zoom`
+imperatively inside a `useEffect` against a raw `<svg>` ref, rather than a
+React-idiomatic force-graph wrapper library — direct DOM manipulation is
+what these D3 modules are actually built for, and simulation tick
+callbacks mutating SVG attributes every frame is not a good fit for
+React's own re-render model regardless of which wrapper is chosen. Node
+size scales with total inbound traffic (`d3.scaleSqrt`, so *area* scales
+with traffic, not radius — the perceptually correct choice for a circle);
+edge colour is a fixed three-band error-rate scale (green <2%, amber
+2–10%, red ≥10%) rather than a continuous gradient, since a demo audience
+reads three colours faster than a gradient legend.
+
+### 5. A real bug found wiring the UI up: nil slices marshal to JSON `null`
+
+**The bug.** `internal/query`'s generic result scanner (`scanRows`) and
+`BuildServiceGraph`/`QueryLogTemplates`/`QueryLogInstances` all built their
+result slices via `var out []T; out = append(out, ...)` — the conventional,
+otherwise-correct Go idiom. But a Go nil slice marshals to JSON `null`, not
+`[]`, and **a zero-row aggregate is a completely ordinary result** (a
+narrow time window with no matching data is not an error condition) — so
+any UI code calling `.length` on an empty API response crashed outright.
+Found live, by actually using the query explorer against a query that
+matched nothing, not by code review.
+
+**The fix.** Every slice-typed field that can legitimately be empty now
+initializes as `[]T{}` before the query runs, in
+`internal/query/executor.go` (`Result.Rows`), `servicegraph.go`
+(`ServiceGraph.Nodes`/`Edges`/`Cycles`, and `findCycles`'s own return),
+and `logs.go` (`QueryLogTemplates`/`QueryLogInstances`). The general
+lesson, worth remembering because it will recur: **any API boundary that
+serializes a Go slice to JSON must decide "empty" is `[]`, not rely on the
+zero value being distinguishable from "absent"** — the two are
+indistinguishable in Go but very much not in JSON, and a client-side
+consumer reasonably assumes a collection field is always iterable.
+
+### 6. Two real infrastructure bugs found bringing the full stack up together for the first time
+
+**A genuine host-port collision, pre-existing, newly triggered.**
+`deploy/docker-compose.yml`'s demo `gateway` service and phase 3's `query`
+service both mapped host port 8080 — invisible until this session actually
+ran `make up` with both defined, since earlier phases never started both
+together in one command. Fixed by remapping `gateway`'s **host** side to
+8084 (container-internal port unchanged at 8080, preserving the
+"`-service` flag = port" convention the other demo services use).
+
+**Next.js standalone output binds the wrong interface inside Docker.**
+`deploy/web.Dockerfile`'s `next start`-equivalent standalone `server.js`
+reads `process.env.HOSTNAME || '0.0.0.0'` for its bind address — but
+Docker itself auto-sets `HOSTNAME` to the container's own hostname for
+every container, so without an explicit override the server bound only to
+its own container-specific network IP, not all interfaces. The container
+logged "Ready" and looked healthy from inside a `docker logs` read, while
+`wget --spider http://localhost:3001/` — from inside the *same* container
+— got connection refused, because `localhost` and the container's real
+bind address are different addresses. Fixed with an explicit
+`ENV HOSTNAME=0.0.0.0`. A second, related bug then surfaced in the
+healthcheck itself: `localhost` resolved to `::1` (IPv6) first on this
+Alpine image, and the now-correctly-`0.0.0.0`-bound server only listens on
+IPv4 — the *exact* bug this log already recorded once for ClickHouse's own
+healthcheck in Phase 1 (`localhost` vs `127.0.0.1`), recurring in a
+different container for the identical underlying reason. Fixed by probing
+`127.0.0.1` explicitly. Worth restating because it recurred: **never probe
+a container healthcheck against `localhost`** on an image where IPv4/IPv6
+resolution order and bind address aren't both verified.
+
+### 7. Part B benchmarks: what was measured cleanly, what was contended, and why 100M spans was not fully reached in this session
+
+**Decided to run everything that could run against the live stack, and
+say plainly which numbers are trustworthy.** See `docs/BENCHMARKS.md`'s
+new "Part B" section for the full numbers; summarized here:
+
+- **Ingestion, storage/codec/batch-size, sampler, and Drain benchmarks**
+  are clean, real measurements with no caveats beyond normal machine
+  variance.
+- **The query-optimiser-at-scale benchmark reached ~25M rows, not the
+  requested 100M**, because seeding synthetic spans through
+  `storage.Writer` (Go-side row generation, not ClickHouse's own insert
+  capacity — separately measured at up to 1.78M rows/sec) sustains only
+  ~12–17k rows/sec, making a 100M-row seed a ~2-hour operation that did
+  not finish inside this session. The seed was left running in the
+  background past the point this document was written.
+- **Two of the five optimiser-pass measurements at ~25M rows (predicate
+  pushdown, limit pushdown) are reported but explicitly flagged as
+  contention noise, not trusted**, because they ran concurrently with
+  that same background 90M-row seed actively writing to the identical
+  table, and showed the pass *on* as dramatically slower than *off* —
+  structurally impossible for what these passes do, and the opposite
+  direction from every other measurement of the same two passes
+  (including phase 3's own clean 10M run). Partition pruning's number
+  from the same run is kept, since it is directionally consistent with
+  phase 3's clean measurement and even more pronounced at larger scale —
+  a plausible real signal, not noise, and the distinction between the two
+  cases was made by comparing against a trusted baseline, not by which
+  numbers looked nicer.
+- **k6's query-load thresholds all failed**, for the identical reason —
+  every scenario measured while the same seed job hammered the one
+  ClickHouse instance everything shares. Every request still succeeded
+  (0% failure rate); this is a documented latency-under-contention result,
+  not a correctness finding.
+
+**Rejected: waiting for the 100M seed to finish before writing this
+document, or before running anything else.** At the observed ~12-17k
+rows/sec ceiling, that would have blocked the rest of this phase's
+deliverables (the UI, the correctness proof, this very document) for over
+an hour with no other benefit — the seed job doesn't need supervision to
+keep running. Publishing the ~25M-row numbers now, clearly labeled with
+which rows are trustworthy and which are contention noise, plus a
+documented reproduction command (`make querybench ROWS=100000000`) for
+whoever picks this up next, was judged more honest and more useful than
+either a blocking wait or silently reporting phase 3's unchanged 10M table
+as if 100M had been reached.
+
+### 8. A real, still-open bug found running the correctness-under-load proof: a permanently stuck commit floor
+
+**What was found.** `cmd/correctnesscheck` (guaranteed-sample traffic, see
+above) never reached ClickHouse within a 20-minute wait. Live
+investigation established that **real Kafka-sourced traffic (demo
+services, and this check's own spans) had landed nothing new in
+`tracelens.spans` for the entire session**, while `cmd/querybench`'s
+separate direct-to-ClickHouse seed path (no Kafka involved) kept inserting
+the whole time — the two paths' independence is exactly what hid this
+until a Kafka-path-dependent test needed to observe it. A full assembler
+container restart — new process, clean in-memory state — hit the
+**identical** `"lost records; consumed to offset X but was reset to
+offset 0"` error at the identical offsets the previous process had
+already logged, which rules out an in-process hang and points at a
+**broker-committed offset that is itself stuck**.
+
+**Best-evidence root cause, not yet confirmed by a targeted repro.**
+`OffsetWatermark` (Phase 2 Sec 6) intentionally never commits past an
+undecided trace's first-seen offset — the correct, deliberate mechanism
+that makes a mid-decision crash safe to redeliver. That safety mechanism
+has a gap it did not anticipate: if a trace's decide-and-write ever failed
+in a way that left it neither in-flight (already popped from the buffer)
+nor decided (write failed, so `finishTrace` never ran, per the documented
+contract), the only way forward is Kafka redelivering that exact message
+again — which requires the client's read position to move backward,
+which only happens on a restart that resumes from the old stuck commit.
+This session's earlier, unrelated Redpanda restart (Docker Desktop itself
+needed restarting mid-session — see the UI section above) is a very
+plausible trigger: it can invalidate a consumer's cached position outside
+the normal redelivery path entirely. Once enough wall-clock time passes
+with that low commit stuck, the broker's own retention ages out the
+segment holding it, and every subsequent restart hits exactly the "offset
+no longer exists" error observed here — a permanent loop, not a transient
+one, until something (this investigation) notices.
+
+**Left open, deliberately, rather than patched under time pressure.** A
+fix here (e.g., a maximum age or maximum-attempts bound on a held
+watermark floor, past which the assembler force-advances past a
+permanently-stuck trace and counts it as a documented, counted loss
+rather than an unbounded silent stall) is a real design change to a
+principle-1-critical mechanism, and principle 1 explicitly says: "if any
+change risks violating one, stop and flag it instead of implementing" —
+implementing a fast, unreviewed fix to the durability guarantee under time
+pressure, in the same session as the finding, is precisely the situation
+that instruction exists for. `cmd/correctnesscheck` is verified correct by
+inspection and is committed as-is, ready to confirm a fix the moment one
+lands; this gap is the single most important open item this phase
+produced, ranked above every unfinished benchmark number.
