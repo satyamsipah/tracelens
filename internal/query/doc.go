@@ -1,22 +1,28 @@
-// Package query will hold the query engine (phase 3):
-// DSL -> lexer -> parser -> AST -> logical plan -> physical plan.
+// Package query implements the TraceLens query engine end to end: a
+// hand-written lexer and recursive-descent parser producing an AST, a
+// logical planner (Scan -> Filter -> Project -> Aggregate -> Sort ->
+// Limit), five independently-testable optimiser passes, and a physical
+// compiler to parameterised ClickHouse SQL. No off-the-shelf query
+// language library is used anywhere in this package -- the planner is the
+// point of the exercise.
 //
-// Empty by design in phase 1. Written by hand, with no off-the-shelf query
-// language library -- the planner is the point of the exercise.
+// Two facts about the storage layer shape the planner throughout:
 //
-// Two facts about the storage layer constrain the planner from the start:
-//
-//   - Aggregates MUST weight by sampling_weight. Once phase 2 samples,
-//     count() over tracelens.spans is not the number of spans that happened;
-//     sum(sampling_weight) is. A planner that emits a bare count() produces
-//     an answer that looks right and is wrong.
+//   - Aggregates weight by sampling_weight (CLAUDE.md principle 6):
+//     count() over tracelens.spans is not the number of spans that
+//     happened once anything samples; sum(sampling_weight) is. See
+//     aggExprSQL in physical.go.
 //
 //   - Attribute values are stored as String, having been flattened from
-//     OTLP's AnyValue. Numeric predicates over attributes therefore need an
-//     explicit cast, and the planner should push those into ClickHouse rather
-//     than filtering after the scan.
+//     OTLP's AnyValue. A numeric predicate or aggregation over an
+//     attribute gets an explicit toFloat64OrNull cast, pushed into
+//     ClickHouse rather than applied after the scan.
 //
-// Physical planning should aim at the spans table's sort key
-// (service_name, span_name, timestamp): a predicate on service and time
-// prunes granules, while one on duration alone does not.
+// Beyond the DSL pipeline, this package also reads two ClickHouse-side
+// projections that are populated by other packages, not computed here:
+// BuildServiceGraph (servicegraph.go) reads the pre-aggregated
+// service_edges rollup -- the cross-service join it depends on happens in
+// internal/sampling.ExtractServiceEdges, at trace-decision time, not in
+// this package or in ClickHouse -- and QueryRED (red.go) reads the
+// red_rollup_1m/5m/1h chain. Neither ever scans raw spans.
 package query
