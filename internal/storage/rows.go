@@ -8,9 +8,10 @@ import (
 
 // Table names, fully qualified. Nothing outside this package spells them.
 const (
-	TableSpans   = "tracelens.spans"
-	TableLogs    = "tracelens.logs"
-	TableMetrics = "tracelens.metrics"
+	TableSpans        = "tracelens.spans"
+	TableLogs         = "tracelens.logs"
+	TableMetrics      = "tracelens.metrics"
+	TableLogTemplates = "tracelens.log_templates"
 )
 
 // SpanRow mirrors tracelens.spans one-for-one, in declaration order. The
@@ -71,6 +72,17 @@ type MetricRow struct {
 	LabelsHash uint64
 }
 
+// TemplateRow mirrors tracelens.log_templates. Written whenever Drain
+// (internal/logs) reports a template that is new or has just widened
+// further -- see logs.TemplateUpsert for why a widen must upsert, not just a
+// creation.
+type TemplateRow struct {
+	TemplateID   uint32
+	TemplateText string
+	FirstSeen    time.Time
+	UpdatedAt    time.Time
+}
+
 const (
 	insertSpans = "INSERT INTO tracelens.spans (" +
 		"timestamp, trace_id, span_id, parent_span_id, service_name, span_name, span_kind, " +
@@ -84,6 +96,9 @@ const (
 
 	insertMetrics = "INSERT INTO tracelens.metrics (" +
 		"timestamp, service_name, metric_name, metric_type, value, labels, labels_hash)"
+
+	insertLogTemplates = "INSERT INTO tracelens.log_templates (" +
+		"template_id, template_text, first_seen, updated_at)"
 )
 
 // fixedBytes pads or truncates to exactly n bytes.

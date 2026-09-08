@@ -21,9 +21,10 @@ var ErrWriterClosed = errors.New("storage writer closed")
 // Flush is one unit of work for the writer: the rows decoded from one Kafka
 // poll, plus the token that makes re-inserting them harmless.
 type Flush struct {
-	Spans   []SpanRow
-	Logs    []LogRow
-	Metrics []MetricRow
+	Spans     []SpanRow
+	Logs      []LogRow
+	Metrics   []MetricRow
+	Templates []TemplateRow
 
 	// Token is derived from the Kafka topic, partition and offset range, so a
 	// redelivered batch produces the IDENTICAL token and ClickHouse discards
@@ -41,8 +42,8 @@ func NewFlush(token string) *Flush {
 	return &Flush{Token: token, done: make(chan error, 1)}
 }
 
-// Rows reports the total row count across all three tables.
-func (f *Flush) Rows() int { return len(f.Spans) + len(f.Logs) + len(f.Metrics) }
+// Rows reports the total row count across all four tables.
+func (f *Flush) Rows() int { return len(f.Spans) + len(f.Logs) + len(f.Metrics) + len(f.Templates) }
 
 // Empty reports whether there is nothing to write.
 func (f *Flush) Empty() bool { return f.Rows() == 0 }
@@ -175,6 +176,11 @@ func (w *Writer) write(ctx context.Context, f *Flush) error {
 			return err
 		}
 	}
+	if len(f.Templates) > 0 {
+		if err := w.insertTemplates(ctx, f); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -239,6 +245,27 @@ func (w *Writer) insertMetrics(ctx context.Context, f *Flush) error {
 		}
 		return nil
 	}, insertMetrics)
+}
+
+// insertTemplates writes new-or-widened template dictionary rows.
+//
+// No dedup token is attached: log_templates is a ReplacingMergeTree keyed on
+// template_id specifically so a repeat upsert (create, then one or more
+// widen events) collapses to the LATEST text on merge, which is the desired
+// behavior here -- unlike spans/logs/metrics, a "duplicate" template_id row
+// is not a bug to suppress, it is how a widened template's text propagates.
+func (w *Writer) insertTemplates(ctx context.Context, f *Flush) error {
+	return w.runInsert(ctx, TableLogTemplates, "", len(f.Templates), func(batch driver.Batch) error {
+		for i := range f.Templates {
+			r := &f.Templates[i]
+			if err := batch.Append(
+				r.TemplateID, r.TemplateText, r.FirstSeen, r.UpdatedAt,
+			); err != nil {
+				return fmt.Errorf("append template row %d: %w", i, err)
+			}
+		}
+		return nil
+	}, insertLogTemplates)
 }
 
 func (w *Writer) runInsert(ctx context.Context, table, token string, rows int, fill func(driver.Batch) error, query string) error {
