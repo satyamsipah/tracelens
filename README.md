@@ -4,8 +4,9 @@ An OpenTelemetry-compatible observability platform: telemetry ingestion,
 columnar storage, tail-based sampling, and a query engine for distributed
 traces, logs and metrics.
 
-**Current phase: ingestion, storage, tail-based sampling, and the log
-pipeline.** The query engine and UI are not implemented yet — see
+**Current phase: ingestion, storage, tail-based sampling, the log pipeline,
+a hand-written query engine, the service dependency graph, and anomaly
+detection/alerting.** Only the UI is not implemented yet — see
 [Roadmap](#roadmap).
 
 ---
@@ -107,18 +108,22 @@ make down
 | Path | What lives there |
 |---|---|
 | `cmd/collector` | OTLP receiver → bounded queue → Redpanda |
-| `cmd/assembler` | Redpanda → decode → ClickHouse (tail sampling lands here) |
-| `cmd/query` | Query engine (stub — phase 3) |
+| `cmd/assembler` | Redpanda → decode → ClickHouse (tail sampling, service-graph edges land here) |
+| `cmd/query` | Query engine HTTP API: execute, explain, trace-by-id, services, service graph; alert evaluator |
+| `cmd/querybench` | Optimiser on/off benchmark harness (bytes read, latency) at real scale |
 | `cmd/loadgen` | Synthetic span generator |
 | `cmd/migrate` | Standalone schema migration runner |
 | `internal/ingest` | OTLP transports, splitting, bounded queue, batching |
 | `internal/pipeline` | Kafka producer/consumer, commit-gated offset tracking |
-| `internal/sampling` | Trace buffer, policy chain, router, cardinality guard |
+| `internal/sampling` | Trace buffer, policy chain, router, cardinality guard, service-edge extraction |
 | `internal/logs` | Drain template extraction, template dictionary |
+| `internal/query` | DSL lexer/parser/AST, logical plan, 5 optimiser passes, physical SQL compiler, executor, service graph, RED reader |
+| `internal/anomaly` | Rolling seasonal z-score detector with hysteresis |
+| `internal/alerting` | YAML rules, scheduled evaluation, webhook/Slack sinks, dedup, cooldown |
 | `internal/storage` | ClickHouse schema, migrations, decoding, async writer |
 | `internal/observability` | Prometheus registry, admin server, logging |
 | `demo/` | Four instrumented services in one binary |
-| `deploy/` | Compose stack, Dockerfile, ClickHouse and Prometheus config |
+| `deploy/` | Compose stack, Dockerfile, ClickHouse, Prometheus and Grafana config |
 
 ---
 
@@ -276,6 +281,169 @@ days, ERROR/FATAL for 90 days (`internal/storage/migrations/0006_log_templates.u
 
 ---
 
+## Query engine
+
+A hand-written DSL, lexer, parser, logical planner, five optimiser passes,
+and a physical compiler to parameterised ClickHouse SQL — no off-the-shelf
+query language library anywhere in `internal/query`.
+
+```
+{service="checkout", status=error} | duration > 500ms | count by (operation)
+```
+
+Label selectors (`=`, `!=`, `=~`, `!~`), numeric filters with duration units
+(`500ms`, `1h30m`), a time range (`since 1h`, `range(...)`, defaulting to the
+last hour when omitted), aggregations (`count`, `sum`, `avg`, `min`, `max`,
+`p50`/`p95`/`p99`, several in one query), `sort by`, `limit`, and a dedicated
+`trace("<id>")` point-lookup form that bypasses the planner entirely and
+goes straight through the `trace_id` bloom index. Every parse error points
+at the exact line and column (`query:1:29: unexpected "error", expected...`),
+and `FuzzParser` has run millions of executions against the lexer/parser
+with zero crashes — its job is crash-freedom, not semantic correctness,
+which the table-driven parser tests cover instead.
+
+**Sampling-aware aggregation, concretely (CLAUDE.md principle 6):**
+`count` compiles to `sum(sampling_weight)`, never `count(*)`; `sum`/`avg`
+weight every value the same way; `p50`/`p95`/`p99` use ClickHouse's
+`quantileTDigestWeighted`, which is a genuinely weighted quantile, not an
+approximation of one (its weight argument must be an unsigned integer, so
+`sampling_weight` is rounded — `toUInt64(round(sampling_weight))` — a small,
+documented, accepted approximation). `min`/`max` are deliberately **not**
+reweighted: sampling makes the true population extreme less likely to have
+been observed at all, and no weighting formula fixes that.
+
+**Logical plan:** `Scan -> Filter -> Project -> [Aggregate] -> [Sort] ->
+[Limit]`, always in that fixed shape. **Five optimiser passes**, in this
+order, each independently testable and each with a dedicated ablation test
+proving it changes the generated SQL (`internal/query/ablation_test.go`):
+
+1. **Constant folding + predicate simplification** — tightens redundant
+   range comparisons on the same field to their intersection, dedupes exact
+   duplicates, and folds a contradictory or impossible range straight to
+   "no rows" rather than scanning for an outcome that's already known.
+2. **Predicate pushdown into the scan** — moves a filter into the scan's own
+   `WHERE`. Cannot push a predicate that sits above an `Aggregate` (it may
+   reference the aggregate's *output*, which doesn't exist until the
+   aggregate runs) — that boundary is enforced structurally, not just by
+   convention, and is unit-tested by hand-building exactly that plan shape.
+3. **Partition pruning from the time range** — rewrites the bound into the
+   exact half-open form (`timestamp >= start AND timestamp < end`) the
+   partition index and sort key can use, never wrapped in a function that
+   would defeat both.
+4. **Limit pushdown, never across an aggregate** — lets the scan itself
+   carry `LIMIT N` (an early-exit hint) when nothing between `Limit` and
+   `Scan` changes which rows count toward "first N"; refuses to cross
+   `Sort` or `Aggregate`, where it would silently corrupt results.
+5. **Projection pushdown** — restricts the scan to exactly the columns an
+   aggregate query's filter, group-by and aggregation expressions actually
+   reference, so `span_attributes`, event arrays and link arrays are never
+   even decompressed for a query that never looks at them. Runs last,
+   since it needs the fully settled plan to compute that closure. A raw
+   (non-aggregate) span listing is left unrestricted — there's no explicit
+   column list in the DSL to narrow to.
+
+The physical compiler is bottom-up and compositional: a node wraps its
+input in a subquery only when it carries a genuinely unpushed
+transformation, so disabling one pass produces textually different SQL
+(a wrapping `WHERE`, a bare `SELECT *`, a missing inner `LIMIT`) rather than
+the compiler quietly absorbing the difference regardless — verified
+directly by a dedicated ablation test per pass before any benchmark ever
+ran on the result.
+
+**Measured on 10.3M real rows** (`make querybench`): partition pruning is
+the standout — **13.0× fewer bytes read, a 5.2× latency improvement**
+(1.965s → 377ms) for a query scoped to the last hour of a week-old table.
+Limit pushdown cuts latency 2.1× via early scan termination even where
+bytes read barely move. Not every pass shows a large win, and the full
+table in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) says exactly why for each
+one — including a case where predicate pushdown's real, structural SQL
+effect didn't translate to a latency win at this specific scale, reported
+as measured rather than rounded into a cleaner story.
+
+**`EXPLAIN`** returns the logical plan, the optimised plan, the compiled SQL
+and bound arguments, and — against a live connection — ClickHouse's own
+`EXPLAIN` output and `EXPLAIN ESTIMATE` row count. **Every query** goes
+through a preflight `EXPLAIN ESTIMATE` checked against a configurable
+max-rows-scanned guard *before* it runs, plus a hard wall-clock timeout —
+an unbounded query against a multi-billion-row table is a self-inflicted
+denial of service, not just a slow request.
+
+**Every identifier is validated, every value is bound.** Column names come
+only from a fixed allow-list; attribute keys and every literal travel as
+`?` parameters, never string-formatted into SQL — checked directly by a
+test that hand-builds a `ColumnRef` containing `"password; DROP TABLE
+spans; --"` and asserts compilation refuses it.
+
+**API** (`cmd/query`, port `8080`): `POST /api/query`, `POST /api/explain`,
+`GET /api/trace/{id}`, `GET /api/services`, `GET /api/services/graph?window=1h`.
+
+---
+
+## Service graph, anomaly detection and alerting
+
+**The service dependency graph is computed incrementally, not with a
+per-request scan or a ClickHouse-side join.** The join a graph needs — a
+child span to its *parent* span, to know who called whom — can't be a
+ClickHouse materialized view: an MV fires per insert block, and a trace's
+parent and child spans aren't guaranteed to land in the same one. The
+assembler already builds the full parent-child tree in memory to make the
+tail-sampling decision, so `internal/sampling.ExtractServiceEdges` does the
+join right there, once per decided trace, emitting one pre-joined
+caller→callee row per cross-service call (same-service parent-child calls
+are internal, not graph edges). ClickHouse's job is then only the
+genuinely incremental part: an `AggregatingMergeTree` rolls those rows up
+by minute (`tracelens.service_edges`), and the graph endpoint reads that —
+never raw spans.
+
+Cycle detection (a real call graph should be a DAG; a cycle is either a
+genuine circular dependency or a tracing bug) and a per-service
+criticality score (the fraction of total call volume flowing *into* that
+service — "how much of everything depends on this being up") are computed
+in Go over the small aggregated edge set, alongside articulation-point
+detection (services whose removal would disconnect the graph — a
+structural single-point-of-failure signal, independent of volume).
+
+**RED metrics are pre-aggregated at 1m/5m/1h**, each level a rollup of the
+level below (`spans -> red_rollup_1m -> red_rollup_5m -> red_rollup_1h`, via
+`quantilesTDigestWeightedMergeState` re-aggregating an already-aggregated
+state rather than re-scanning raw spans three times). The storage-vs-query
+trade-off: finer rollups are precise but expensive to keep long (1m: 7-day
+TTL); coarser rollups are cheap to keep for a year (1h: 400-day TTL) at the
+cost of minute-level resolution — see docs/DECISIONS.md for the full
+reasoning.
+
+**Anomaly detection** (`internal/anomaly`) is a rolling seasonal z-score:
+a bounded sliding-window median/MAD baseline per (service, operation,
+hour-of-day, day-of-week) bucket — genuine order statistics from a fixed
+32-sample ring buffer, not an EWMA approximation of them — with hysteresis
+(trigger at 3σ, clear at 1.5σ, two consecutive ticks either direction, so
+one noisy point can't flap an alert). Evaluated against injected synthetic
+anomalies on a known seasonal population: **precision 0.806, recall
+0.833** (`internal/anomaly/detector_test.go`). An STL-decomposition
+alternative was considered and rejected for now — see DECISIONS.md — since
+it's a batch/windowed fit that doesn't update incrementally the way every
+other piece of state in this codebase does.
+
+**Alerting** (`internal/alerting`) evaluates YAML rules
+([`deploy/tracelens/alerts.yaml`](deploy/tracelens/alerts.yaml)) on a
+schedule, notifying a webhook or Slack incoming-webhook only on a firing
+*state transition* (dedup — a rule that stays firing for an hour notifies
+once, not every tick) and never more often than its configured cooldown,
+independent of how fast the underlying condition flaps. A rule is either
+`anomaly`-typed (rides the detector above) or `threshold`-typed (a fixed
+SLO number, for when "acceptable" is a contract, not a baseline).
+
+**Self-monitoring:** TraceLens ingests its own telemetry. The Grafana
+dashboard at [`deploy/grafana/dashboards/self-monitoring.json`](deploy/grafana/dashboards/self-monitoring.json)
+covers ingestion rate, queue depths, drops, sampler memory, consumer lag,
+storage size and compression ratio — the last two read live from
+`system.parts` via a second (ClickHouse) Grafana datasource, since neither
+has a Prometheus metric behind it. Consumer lag is a wall-clock proxy
+(`time.Since(record.Timestamp)` at consume time), not an offset-based one —
+a documented, accepted simplification, not a hidden gap.
+
+---
+
 ## Testing
 
 ```bash
@@ -288,7 +456,14 @@ Storage and broker behaviour is tested against real containers, never mocks —
 including that a replayed Kafka batch is a no-op, that duplicates collapse
 under `FINAL`, and that out-of-order timestamps lose nothing. The
 Testcontainers ClickHouse mounts the *production* `storage.xml`, so the schema
-under test is byte-identical to the deployed one.
+under test is byte-identical to the deployed one. `internal/query` and
+`cmd/query` follow the identical pattern — every DSL query, EXPLAIN, trace
+lookup, and service-graph test runs against a real, migrated ClickHouse,
+never a stand-in.
+
+```bash
+make querybench  # optimiser on/off benchmark at real scale (needs `make up` first)
+```
 
 ### Hot path
 
@@ -331,6 +506,11 @@ nothing set. The knobs that matter:
 | `TRACELENS_BUFFER_MAX_BYTES` | `256MiB` | In-flight buffer cap, bytes |
 | `TRACELENS_BUFFER_EVICTION` | `forced_decision` | `forced_decision` or `discard` at capacity |
 | `TRACELENS_DRAIN_DEPTH` / `_SIMILARITY` / `_MAX_CHILDREN` / `_MAX_TEMPLATES` | see `internal/config` | Drain tree shape and template caps |
+| `TRACELENS_QUERY_HTTP_ADDR` | `:8080` | Query API listen address |
+| `TRACELENS_QUERY_TIMEOUT` | `30s` | Per-query hard wall-clock bound |
+| `TRACELENS_QUERY_MAX_ROWS_SCANNED` | `50000000` | Preflight `EXPLAIN ESTIMATE` guard |
+| `TRACELENS_ALERT_RULES_FILE` | `/etc/tracelens/alerts.yaml` | Alerting rules; missing/invalid disables alerting, not startup |
+| `TRACELENS_ALERT_EVAL_INTERVAL` | `60s` | How often every alert rule is evaluated |
 
 ### Metrics worth watching
 
@@ -341,6 +521,7 @@ nothing set. The knobs that matter:
 - `tracelens_decisions_total{outcome,policy}`, `tracelens_late_spans_total{outcome}`
 - `tracelens_cardinality_breaches_total{key}`, `tracelens_cardinality_estimate{key}`
 - `tracelens_templates_created_total`, `tracelens_templates_evicted_total`, `tracelens_templates_total`
+- `tracelens_consumer_lag_seconds{topic}` — a wall-clock proxy, not offset-based
 
 ---
 
@@ -351,8 +532,10 @@ These are deliberate and recorded in [docs/DECISIONS.md](docs/DECISIONS.md):
 - **Histogram buckets are not stored.** The schema's single `Float64 value`
   cannot hold bucket bounds; histograms decompose into `_count` and `_sum`
   series, so quantile queries over histograms are not answerable yet.
-- **Attribute values are flattened to `String`.** Numeric predicates in the
-  query engine will need a cast.
+- **Attribute values are flattened to `String`.** Resolved for querying:
+  the query engine casts a numeric predicate over an attribute
+  (`toFloat64OrNull(...)`) automatically; the underlying storage
+  representation is unchanged.
 - **OTLP/JSON is not implemented** (protobuf only — JSON is optional in the
   spec). A JSON request gets `415` rather than a silent misparse.
 - **The `spans` ORDER BY costs ~4.2× read amplification on a service+time

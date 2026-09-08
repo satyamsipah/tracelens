@@ -853,3 +853,411 @@ unit-tested); 12,000 real log records templated into exactly 5 clusters;
 key; `probabilistic` confirmed reachable and deciding after the mutual-
 exclusion fix, where before the fix it never appeared in
 `tracelens_decisions_total` at all.
+
+---
+
+## 2026-09-08 — Phase 3: query engine, service graph, anomaly detection, alerting
+
+Three decisions were gated behind explicit approval before any code was
+written: the DSL grammar, the optimiser pass list/order, and the
+anomaly-detection approach. A fourth genuine trade-off (default time range
+when a query omits one) was also put to explicit approval rather than
+decided silently.
+
+### 1. DSL grammar: approved as proposed, with one grammar gap found immediately
+
+**Decided.** The full grammar (label selectors with `=`/`!=`/`=~`/`!~`,
+numeric filters with duration units, `since`/`range` time bounds defaulting
+to the last hour, `count`/`sum`/`avg`/`min`/`max`/`p50`/`p95`/`p99`
+aggregations — several in one query — `sort by`, `limit`, and a dedicated
+`trace(...)` point-lookup form) is exactly what was proposed and approved.
+
+**One gap surfaced immediately writing the first parser test**: the
+requirement's own canonical example, `{service="checkout", status=error}`,
+has an **unquoted** value (`error`) sitting next to a quoted one
+(`"checkout"`) in the same selector. The originally-specified grammar
+(`LabelExpr := IDENT LabelOp STRING`) would reject the very example it was
+approved against. Fixed by accepting either a quoted string or a bare
+identifier as a label value — both lex unambiguously, so there is no new
+ambiguity, and it matches the common convention of not requiring quotes
+around an enum-like value. Caught by `TestParserShouldParseExampleQueryIntoExpectedShape`
+failing on its very first run against the literal example from the prompt,
+not by inspection.
+
+### 2. Optimiser passes: approved order, but the physical compiler needed a real redesign to make them measurable
+
+**Decided.** All five passes ship in the approved order
+(`constant_fold -> predicate_pushdown -> partition_pruning ->
+limit_pushdown -> projection_pushdown`), each independently testable
+against a hand-built `LogicalPlan`.
+
+**A design flaw found before ever writing a benchmark, not after.** The
+first physical compiler (`Compile`) walked the plan tree once, collecting
+whichever node currently held the predicate/columns/limit and assembling
+ONE flat `SELECT` statement. This is simple and produces correct SQL either
+way — but it means the compiler finds the predicate (or column list, or
+limit) **regardless of which pass ran**, so a pass being skipped produced
+**textually identical SQL** to the pass running. Predicate pushdown and
+limit pushdown, specifically, would have measured a rounding-error
+difference no matter how the benchmark queries were chosen, not because
+the passes are unimportant but because the compiler had already made them
+invisible.
+
+**Fixed by making Compile compositional and bottom-up**: each logical node
+now wraps its input in a SQL subquery *only* when it still carries a
+genuinely unpushed transformation (an unpushed `Filter` becomes a real
+`SELECT * FROM (...) WHERE ...` wrapper; a `Scan` with no column
+restriction reads via `SELECT *`; a `Limit` not pushed to the scan appears
+only in the outermost wrapper). A pass either changes the generated SQL or
+it doesn't — there is no third option where the compiler quietly does the
+right thing regardless. `internal/query/ablation_test.go` asserts this
+directly and by construction for all five passes (e.g.
+`TestAblationPredicatePushdownChangesGeneratedSQL` asserts `on.SQL !=
+off.SQL` and inspects the specific textual difference) — written and
+passing *before* `cmd/querybench` ever ran, specifically so the benchmark
+numbers that followed would be measuring something real. The
+`@storage-reviewer` audit later confirmed empirically (via a live
+`EXPLAIN`) that ClickHouse fully flattens the resulting nested-subquery SQL
+into a single flat execution plan (`Filter -> Sorting ->
+ReadFromMergeTree`) with no redundant materialisation — the compositional
+style costs nothing at execution time, it only changes what the *compiler*
+does with an unpushed transformation.
+
+**Weighted aggregation, concretely** (principle 6): `count` is
+`sum(sampling_weight)`; `sum`/`avg` weight every value the same way;
+`min`/`max` are deliberately left unweighted, since sampling makes the true
+population extreme *less* likely to have been observed at all and no
+weighting formula recovers it — an accepted, documented statistical bias,
+not a bug. `p50`/`p95`/`p99` use ClickHouse's `quantileTDigestWeighted`,
+discovered live (a migration failure, not a design guess) to require its
+weight argument as an **unsigned integer**, not `Float64` — ClickHouse
+rejected `Float64` outright with `code: 43`. Fixed by rounding:
+`toUInt64(round(sampling_weight))`. Since weights are `1/p` and therefore
+always $\geq 1$, this is a small, bounded, accepted approximation (an
+exact fractional repeat-count has no meaning for a digest sketch built by
+simulating repetition anyway), not a silent precision loss worth
+engineering around further.
+
+### 3. `EXPLAIN`/`EXPLAIN ESTIMATE` need literal values, not bound parameters — a second live-discovered ClickHouse constraint
+
+**The bug.** `EstimateRows` initially ran `EXPLAIN ESTIMATE <sql>` with the
+query's own bound `?` parameters passed through unchanged. Against a table
+with rows freshly inserted and known to match the predicate, this
+returned **0** estimated rows — silently wrong, not an error. `EXPLAIN`'s
+index-range analysis needs the predicate's actual values at *plan* time;
+the native-protocol wire parameters clickhouse-go sends aren't substituted
+until *execution* time, so the planner has nothing to reason a range from.
+
+**Fixed** by inlining `phys.Args` as literal SQL text for the
+`EXPLAIN`/`EXPLAIN ESTIMATE` diagnostic call specifically
+(`inlineForExplain`) — the real query in `executeSelect`/`executeTrace`
+still always uses genuine bound parameters. This is safe specifically
+because every value in `phys.Args` was produced by `Compile()` from
+already-parsed, already-typed Go values (a parsed literal, a resolved
+attribute key, a computed time bound) — never raw, unescaped user text
+passed through; string literals are still escaped
+(`'`→`''`, `\`→`\\`) before inlining.
+
+### 4. Trace-by-id lookup: bind as a string, not `[]byte`
+
+**The bug.** `trace(<id>)` decodes the hex id to the 16 raw bytes the
+`FixedString(16)` column actually stores, then queried `WHERE trace_id =
+?` with that `[]byte` bound directly. ClickHouse rejected it: `code: 386,
+There is no supertype for types FixedString(16), Array(UInt8)` —
+clickhouse-go's positional-parameter binding infers a bare `[]byte` as
+`Array(UInt8)`, not `FixedString`, which has no common type with the
+column to compare against. **Fixed** by binding `string(idBytes)` instead
+— a Go `string` binds as ClickHouse `String`, which compares against
+`FixedString` natively. (A typed `driver.Batch.Append`, as `storage.Writer`
+uses for inserts, does not have this problem — the column's own type
+governs the conversion there. The failure is specific to ad hoc
+positional-parameter queries.)
+
+### 5. Per-query timeout and max-rows-scanned guard
+
+**Decided.** Every query gets a hard wall-clock `context.WithTimeout` and,
+before that, a preflight `EXPLAIN ESTIMATE` check against a configurable
+row-count ceiling (`TRACELENS_QUERY_MAX_ROWS_SCANNED`, default 50M) — a
+runaway query is refused cheaply before it starts scanning, not merely cut
+off partway through once it already has. An estimate-check failure
+(distinct from an over-budget estimate) is **not** treated as fatal to the
+real query: `EXPLAIN ESTIMATE` is a best-effort guard, and refusing every
+query because the guard itself errored would be worse than the risk it
+exists to catch.
+
+### 6. Default time range: last 1 hour (approved)
+
+**Decided**, by explicit approval. A query with no `since`/`range` clause
+gets the last hour — the cheapest safe default that still bounds the scan
+automatically, matching the common case of an ad hoc debugging query.
+Rejecting an unbounded query outright was considered and rejected: it would
+break the requirement's own canonical example query, which has no range
+clause.
+
+### 7. Service dependency graph: the join happens in Go, at decision time, not in ClickHouse
+
+**Decided.** A service graph needs one join a per-insert-block ClickHouse
+materialized view structurally cannot do: a child span joined to its
+*parent* span, to know who called whom — and a trace's parent and child
+spans are not guaranteed to land in the same insert block, or even the
+same INSERT. The assembler already builds this exact join
+(`sampling.BuildTree`) to make the tail-sampling decision, with every span
+for a trace still in memory together — so
+`internal/sampling.ExtractServiceEdges` walks that already-built tree once
+per **decided** trace and emits one pre-joined `(caller_service,
+callee_service, duration, is_error, weight)` row per **cross-service**
+call (a same-service parent-child pair is an internal call, not a graph
+edge — excluded by construction). `cmd/assembler`'s `emitDecidedTrace`
+rebuilds the tree from the already-in-memory decided spans (cheap relative
+to the network write that follows) rather than threading the tree through
+`EmitFunc`'s signature, keeping that interface stable.
+
+ClickHouse's job is then only the genuinely incremental part:
+`service_edges_raw` (plain `MergeTree`, short 3-day TTL, written with the
+same trace-derived `insert_deduplication_token` spans use, so a redelivered
+decided-trace flush can't double-count call volume) feeds an
+`AggregatingMergeTree` (`service_edges`) via a completely ordinary
+per-insert-block materialized view — ordinary specifically *because* the
+join already happened before the row ever reached ClickHouse.
+`quantilesTDigestWeightedState(0.5, 0.95, 0.99)` stores one state for all
+three latency percentiles per (caller, callee, minute) rather than three
+separate re-scans.
+
+**An orphan span (parent never arrived) is excluded from edge extraction**,
+for the same reason it's excluded from the critical-path computation:
+there is no known caller to draw an edge from. This is not a data-loss
+concern — the orphan's own span is still stored and counted normally
+everywhere else.
+
+**Cycle detection and criticality**, computed in Go over the small
+aggregated edge set (never a raw-span scan): `findCycles` is a single
+white/gray/black DFS pass, and criticality-per-service is inbound call
+weight divided by total graph call weight ("what fraction of everything
+this system does depends on this service being up"), plus articulation-
+point detection (`articulationPoints`, standard Tarjan low-link algorithm
+over the graph's *undirected* connectivity) as an independent, volume-blind
+single-point-of-failure signal.
+
+### 7a. Two real bugs and one honest scope limitation, found by the `@storage-reviewer` audit run against this phase's SQL and graph code
+
+The audit (mirroring the same review pattern used in phases 1 and 2) read
+`internal/query/physical.go`, `internal/query/optimizer.go`,
+`internal/query/servicegraph.go`, and both new migrations, and verified
+several claims empirically against a live ClickHouse rather than only
+reading the SQL text — see BENCHMARKS.md and §2 above for what it confirmed
+was fine (the SQL-injection surface, weighted-aggregation correctness, the
+nested-subquery flattening, the two-level `*MergeState` rollup chain's
+mathematical correctness, and the `articulationPoints` parent-tracking fix
+described below).
+
+**Bug: `findCycles`'s own doc comment overclaimed completeness.** It said
+"lists every simple directed cycle." A single DFS pass only detects a
+back-edge onto whichever ancestor is still on the stack; the audit
+constructed a concrete counter-example (`A→B, B→C, C→A, A→D, D→B`, which
+contains two distinct simple cycles sharing node `B`) where the second
+cycle is missed once `B` turns black after the first is found. **Fixed**
+by correcting the documentation to state what the function actually
+guarantees — at least one cycle reported per cyclic structure, not an
+exhaustive enumeration — rather than silently shipping a doc comment that
+promised more than the algorithm delivers. A full enumeration (Johnson's
+algorithm) was considered and rejected: "flag that a dependency cycle
+exists, with one concrete instance of it" is enough for an operator to act
+on, and the added complexity of exhaustive enumeration wasn't judged worth
+it for that purpose.
+
+**Bug: `findCycles`'s result could vary between runs on identical data.**
+`articulationPoints` already sorted its neighbour lists before traversal
+for determinism; `findCycles` did not, and `BuildServiceGraph`'s query has
+no `ORDER BY`, so the *iteration* order of `adjacency[u]` — and therefore
+which cycle gets reported first when multiple share a node — depended on
+ClickHouse's row-return order rather than the graph's actual structure.
+**Fixed** by sorting each node's outgoing edges before traversal, matching
+the pattern already established in `articulationPoints`.
+
+**Defense-in-depth gap: `ScanNode.Table` was never allow-listed.** Every
+column identifier is checked against `allowedColumns` before it reaches SQL
+text, but `Table` was concatenated raw. Not exploitable today —
+`Build()` hardcodes `"spans"` everywhere — but the file's own stated
+invariant ("every identifier... comes from a fixed allow-list") wasn't
+actually enforced for this one field, and would become a real gap the
+moment a future feature makes the query target data-driven (e.g. querying
+`logs` or `metrics` instead of `spans`). **Fixed** by adding `allowedTables`
+alongside `allowedColumns`, checked before `Table` reaches the SQL text —
+cheap, and closes the gap before it can ever matter rather than after.
+
+**Applied, low-severity: `ttl_only_drop_parts = 1` was missing** on the six
+new day-partitioned, day-multiple-TTL tables across migrations 0007/0008 —
+the exact condition migration 0002's own comment already documents as
+justifying whole-part-drop expiry instead of a mutation rewrite. Added for
+consistency with that established convention.
+
+### 8. RED metrics: three pre-aggregated rollup levels, each derived from the one below
+
+**Decided.** `spans -> red_rollup_1m -> red_rollup_5m -> red_rollup_1h`,
+each an `AggregatingMergeTree` fed by an ordinary per-insert-block
+materialized view (no cross-row join needed at any level — a RED rollup
+only ever needs the row's own service/operation/duration/status, unlike
+the service graph). The 5m and 1h levels are derived from the level below
+via the `*MergeState` combinator family
+(`sumMergeState`/`quantilesTDigestWeightedMergeState`), re-aggregating an
+already-aggregated state into a coarser one — verified by the
+`@storage-reviewer` audit to produce a bit-identical result to computing
+the coarser aggregate directly from raw spans, not merely "probably fine."
+
+**Storage-vs-query-cost trade-off, explicitly**: every rollup level is an
+*additional* copy of the same underlying information, trading storage for
+query latency on the dashboard's hottest query shape (a RED panel that
+would otherwise re-scan raw spans on every page load). One retention grain
+cannot serve both a "last 15 minutes, per-minute resolution" panel and a
+"last 90 days, trend" panel — 1m is precise but too expensive to keep for
+a year (7-day TTL); 1h is cheap enough to keep for over a year (400-day
+TTL) at the cost of being blind to a minute-scale spike. The three-level
+chain is the resolution the assembler and query engine actually need
+today; a genuine 1-day rollup was considered and deferred — nothing in the
+current dashboard or alerting design reads at that grain yet, and adding an
+unused rollup level is exactly the kind of storage cost this decision is
+supposed to be deliberate about, not default to accumulating.
+
+### 9. Anomaly detection: rolling seasonal z-score (approved), sliding-window median/MAD instead of literal EWMA
+
+**Decided**, by explicit approval, over an STL-decomposition alternative —
+see the original proposal for the full trade-off. STL better separates
+trend from seasonality without needing a decay half-life tuned, but is a
+batch/windowed fit that doesn't update incrementally the way every other
+piece of state in this codebase does (the trace buffer, Drain's clusters,
+the HyperLogLog sketches); it remains a documented future option for a
+service with strong slow trend where this baseline visibly lags, not built
+now.
+
+**One deliberate substitution from the approved proposal's literal
+wording, not a silent shortcut.** The proposal said "EWMA-decayed
+median/MAD." Implementing that literally is a contradiction: an
+exponentially-weighted moving average produces a *mean*, not a *median* —
+median and MAD are genuinely order statistics, and EWMA cannot produce
+either on its own without further approximation. The shipped design
+(`internal/anomaly`) instead keeps a bounded ring buffer of the last 32
+observations per (series, hour-of-day, day-of-week) bucket and computes
+the **actual** median and MAD from that window directly (`sort` +
+midpoint, exactly as the terms mean) each time. A fixed-size window bounds
+memory identically to what EWMA decay was meant to achieve (old data ages
+out, just by eviction instead of by shrinking weight) while producing the
+real statistic the design was named for, not an approximation of one. This
+is recorded here specifically so a future reader comparing the shipped
+code against the original proposal understands the change was deliberate
+and why.
+
+Cold start is real and by design: a (service, operation, hour, weekday)
+bucket only recurs once a *week*, so reaching the minimum sample count (8)
+needs 8 weeks of history, not 8 days — exactly the "needs ~2-3 weeks
+before it's reliable" trade-off named in the original proposal, playing out
+concretely in the evaluation harness (which therefore warms 56 days, not
+14, specifically so it exercises the real `DefaultConfig` unmodified rather
+than a loosened one that would look better than production behaviour
+actually is).
+
+**Hysteresis**: trigger at 3σ, clear at 1.5σ, two consecutive ticks
+required in either direction — a value between the two thresholds resets
+the consecutive-tick counters but leaves the current firing state alone,
+so a single noisy point neither flaps a healthy series into alerting nor
+prematurely clears a real one.
+
+**Evaluated against injected anomalies on a known population**
+(`TestDetectorPrecisionRecallOnInjectedAnomalies`): 56 days of seasonal,
+noisy synthetic latency warm the baseline; day 57 injects six 6×-normal
+5-point anomaly windows spread across different hours. **Measured:
+precision 0.806, recall 0.833** — full numbers and the honest explanation
+for why hysteresis costs some of both by design are in
+[docs/BENCHMARKS.md](BENCHMARKS.md).
+
+Two off-by-one test bugs were found and fixed while building this
+evaluation, both from the same root cause (the weekly bucket recurrence
+above): a cold-start unit test originally advanced the clock by one day
+per tick instead of seven, so it never landed in the same bucket twice and
+could never observe a baseline forming at all; and the precision/recall
+harness originally warmed for 14 days, which (for the same reason) gives
+every bucket only 2 samples, not the 8 `DefaultConfig` requires — both
+fixed by advancing in 7-day steps and extending the warm-up to 8 weeks,
+rather than by loosening the detector's own configuration to make a
+too-short test pass.
+
+### 10. Alerting: dedup via state-transition-only notification, cooldown as an independent, separate control
+
+**Decided.** `internal/alerting.Evaluator` tracks one firing bool + last-
+notified timestamp per rule. **Dedup**: a notification only fires on an
+actual state transition (clear→firing or firing→clear) — a rule that
+stays firing for an hour notifies once, not on every evaluation tick.
+**Cooldown**: independent of dedup, a minimum wall-clock gap between two
+notifications for the same rule, suppressing a fast clear-then-refire
+cycle from paging twice in quick succession. The true firing state always
+updates even when cooldown suppresses the notification itself — otherwise
+a later observation would compare against a stale recorded state and could
+never detect the *next* real transition, silently going quiet.
+
+Two rule types ship: `anomaly` (rides `internal/anomaly.Detector`'s own
+hysteresis-adjusted `Firing`/`StateChanged`) and `threshold` (a fixed
+comparison against a caller-supplied value, for an SLO defined as an
+absolute number rather than "unusual relative to history"). Delivery fans
+out to a webhook and/or a Slack incoming-webhook
+(`internal/alerting.MultiSink`, best-effort — one sink's failure doesn't
+block delivery to the others). A missing or invalid rules file degrades
+the query API to "alerting disabled, logged once," not a refused startup —
+unlike the assembler's tail-sampling policy, where CLAUDE.md principle 1
+makes "silently running with no idea what to keep" the worse failure mode,
+a query API with no alerting configured is a normal, supported deployment
+shape.
+
+### 11. Self-monitoring: a second Grafana datasource for the two panels Prometheus can't answer
+
+**Decided.** Ingestion rate, queue depth, drops, sampler memory, consumer
+lag and log/cardinality panels are ordinary Prometheus queries on the
+existing metric set. Storage size and compression ratio are not — they are
+facts about ClickHouse's own `system.parts`, with no Prometheus metric
+behind them anywhere in this codebase, and inventing a gauge nothing else
+would ever populate just to keep a single-datasource dashboard was
+rejected as worse than the alternative. **Decided**: provision a second
+Grafana datasource (`grafana-clickhouse-datasource`) and query
+`system.parts` directly for those two panels, mirroring exactly the query
+`make compression` already runs (down to reusing `system.parts`, not
+`system.columns`, per phase 1's own finding that the latter can report
+zero on a small/fresh table).
+
+**Consumer lag is a wall-clock proxy** (`tracelens_consumer_lag_seconds`,
+`time.Since(record.Timestamp)` at consume time), computed once per topic
+per poll batch from that batch's last record — not an offset-based
+high-watermark-minus-committed number. A true offset lag would need a
+`kadm.FetchOffsets`-style round trip against the broker on every poll,
+which is a real cost this phase chose not to pay for a dashboard panel;
+the wall-clock figure answers the operationally relevant question ("how
+far behind real time is this consumer right now") at effectively zero
+marginal cost, computed from data the consumer already has in hand. This
+limitation is stated directly on the metric's own Prometheus help text and
+in the dashboard panel's description, not left for an operator to discover
+by being confused about why it doesn't match `kafka-consumer-groups.sh`.
+
+### 12. Accepted gaps, phase 3
+
+- **`findCycles` is not an exhaustive simple-cycle enumeration** (see §7a)
+  — a documented algorithmic limitation, not a bug, given what the feature
+  is actually for.
+- **Router-style consistent-hash partitioning for query-side sharding does
+  not exist** — out of scope; the query engine runs against one ClickHouse
+  cluster, not a partitioned fleet of them.
+- **The `querybench` synthetic dataset under-states projection pushdown's
+  real-world benefit** (empty event/link arrays — see BENCHMARKS.md) — an
+  accepted methodology gap in this specific benchmark run, not a defect in
+  the pass itself, which is proven correct structurally by
+  `internal/query/ablation_test.go` and by the aggregate-query column-set
+  assertion in `internal/query/optimizer_test.go`.
+- **A true offset-based consumer-lag metric does not exist** (see §11) —
+  the wall-clock proxy is an accepted, documented substitute.
+- **STL-decomposition anomaly detection is not implemented** (see §9) — a
+  documented future option, not attempted this phase.
+- **`TestWriterDeduplicatesDuplicateInput` is a pre-existing, timing-
+  sensitive test** (ClickHouse's background merge can race the
+  "duplicates visible before FINAL" assertion on a fresh, tiny table under
+  unlucky scheduling) — observed to fail once during this phase's
+  container churn, then confirmed via a 3-for-3 rerun to be flaky, not a
+  regression caused by the new migrations 0007/0008 landing in the same
+  package's test suite. Recorded here rather than silently re-run away,
+  since a flake worth noticing is exactly the kind of thing this log
+  exists to not lose track of.
