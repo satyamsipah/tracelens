@@ -206,6 +206,12 @@ type Query struct {
 	// mode, not "running with no idea what to keep".
 	AlertRulesFile    string
 	AlertEvalInterval time.Duration
+
+	// PrometheusURL backs the UI's system health page: cmd/query proxies a
+	// fixed set of instant queries server-side (Prometheus sets no CORS
+	// headers, so a browser can't hit it directly) rather than the UI
+	// talking to Prometheus itself.
+	PrometheusURL string
 }
 
 // LoadQuery reads query-API configuration from the environment.
@@ -219,6 +225,7 @@ func LoadQuery() Query {
 		MaxRowsScanned:    uint64(envInt("TRACELENS_QUERY_MAX_ROWS_SCANNED", 50_000_000)),
 		AlertRulesFile:    env("TRACELENS_ALERT_RULES_FILE", "/etc/tracelens/alerts.yaml"),
 		AlertEvalInterval: envDuration("TRACELENS_ALERT_EVAL_INTERVAL", 60*time.Second),
+		PrometheusURL:     env("TRACELENS_PROMETHEUS_URL", "http://prometheus:9090"),
 	}
 }
 
