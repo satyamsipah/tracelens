@@ -2,8 +2,10 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -11,11 +13,41 @@ import (
 	"github.com/satyamsipah/tracelens/internal/observability"
 )
 
+// commitRetryInterval bounds how long RunWithCommitGate's poll can block with
+// no new data before it wakes up anyway to recheck the commit ceiling.
+//
+// PollFetches blocks until either new data arrives on SOME subscribed
+// partition or the caller's context is done -- kgo's FetchMaxWait only
+// bounds one broker-side fetch request/response cycle, it does not make
+// PollFetches itself return periodically when idle. Without this wrapping
+// timeout, a partition withheld by the ceiling would only ever get rechecked
+// when unrelated new data happens to arrive on the topic, which is fine
+// under real, continuous OTLP traffic but leaves a withheld commit
+// indefinitely stuck during any genuinely quiet period.
+const commitRetryInterval = 2 * time.Second
+
 // Handler processes one poll's worth of records for a single topic.
 // Returning an error means the offsets are NOT committed and the records will
 // be redelivered, so handlers must be idempotent -- which is what the
 // ReplacingMergeTree sort key and the insert dedup token provide.
 type Handler func(ctx context.Context, topic string, records []*kgo.Record) error
+
+// CommitCeiling reports the highest offset currently safe to commit for one
+// (topic, partition), independent of what this poll happened to fetch.
+//
+// This exists because buffered, delayed processing (the trace assembler)
+// breaks the simple "commit everything this poll saw" model phase 1 used:
+// a span can sit in the in-flight trace buffer for the full completion
+// window before its trace decides, so committing past it the moment it is
+// merely BUFFERED would mean a crash mid-window loses it silently, with no
+// redelivery, since the offset already advanced. ok=false means nothing
+// gates this partition and it is safe to commit up to the highest offset
+// this poll actually fetched -- the same behavior as before this existed.
+type CommitCeiling func(topic string, partition int32) (offset int64, ok bool)
+
+// commitAll is the zero-value ceiling: nothing is ever held back, matching
+// Consumer's original behavior exactly for topics with no buffering.
+func commitAll(string, int32) (int64, bool) { return 0, false }
 
 // Consumer reads a consumer group and dispatches per topic.
 type Consumer struct {
@@ -46,34 +78,86 @@ func NewConsumer(cfg config.Kafka, m *observability.Metrics, log *slog.Logger) (
 	return &Consumer{client: client, cfg: cfg, m: m, log: log}, nil
 }
 
-// Run polls until the context is cancelled.
+// Run polls until the context is cancelled. Equivalent to
+// RunWithCommitGate(ctx, handle, nil) -- every offset this poll fetched is
+// committed once every topic's handler succeeds, exactly as before.
 func (c *Consumer) Run(ctx context.Context, handle Handler) error {
+	return c.RunWithCommitGate(ctx, handle, nil)
+}
+
+// RunWithCommitGate is Run, plus a per-partition ceiling consulted before
+// committing. When ceiling is nil, or returns ok=false for a partition, that
+// partition commits up to the highest offset THIS POLL fetched -- identical
+// to Run. When ceiling returns ok=true with a lower offset, only that lower
+// offset is committed for this partition, and the remainder is retried on a
+// later poll once the ceiling advances.
+func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceiling CommitCeiling) error {
+	if ceiling == nil {
+		ceiling = commitAll
+	}
+
+	type topicPartition struct {
+		topic     string
+		partition int32
+	}
+	// pending and committed persist ACROSS poll iterations, not just within
+	// one. A partition withheld by the ceiling in poll N has no NEW records
+	// in poll N+1 once it is caught up -- fetches only return newly-arrived
+	// data, they do not re-deliver "things we still owe a commit for". Without
+	// remembering the highest offset ever seen here, a later empty poll would
+	// have nothing to retry the ceiling against, and a withheld commit could
+	// never fire even after the ceiling clears.
+	pending := map[topicPartition]int64{}
+	committed := map[topicPartition]int64{}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
 
-		fetches := c.client.PollFetches(ctx)
+		pollCtx, cancelPoll := context.WithTimeout(ctx, commitRetryInterval)
+		fetches := c.client.PollFetches(pollCtx)
+		cancelPoll()
+
 		if fetches.IsClientClosed() {
 			return nil
 		}
 		if errs := fetches.Errors(); len(errs) > 0 {
+			realErr := false
 			for _, e := range errs {
 				if ctx.Err() != nil {
 					return nil
 				}
+				if errors.Is(e.Err, context.DeadlineExceeded) {
+					// Our own commitRetryInterval wake-up timing out, not a
+					// real fetch failure -- there is simply nothing new to
+					// fetch. Fall through so the commit-retry logic below
+					// still runs against whatever is in `pending`.
+					continue
+				}
+				realErr = true
 				c.m.ConsumeErrors.WithLabelValues(e.Topic).Inc()
 				c.log.Error("fetch error",
 					slog.String("topic", e.Topic),
 					slog.Int("partition", int(e.Partition)),
 					slog.String("error", e.Err.Error()))
 			}
-			continue
+			if realErr {
+				continue
+			}
 		}
 
 		byTopic := map[string][]*kgo.Record{}
 		fetches.EachRecord(func(r *kgo.Record) {
 			byTopic[r.Topic] = append(byTopic[r.Topic], r)
+			tp := topicPartition{r.Topic, r.Partition}
+			// Presence check, not a bare `r.Offset > pending[tp]`: a fresh
+			// partition's first-ever offset is legitimately 0, identical to
+			// a Go map's zero-value default for "not present" -- comparing
+			// against that default would silently skip recording it.
+			if cur, ok := pending[tp]; !ok || r.Offset > cur {
+				pending[tp] = r.Offset
+			}
 		})
 
 		failed := false
@@ -91,9 +175,35 @@ func (c *Consumer) Run(ctx context.Context, handle Handler) error {
 
 		// Commit only when every topic in this poll succeeded. Committing a
 		// partial poll would silently drop the failed topic's records.
-		if !failed {
-			if err := c.client.CommitUncommittedOffsets(ctx); err != nil && ctx.Err() == nil {
+		if failed {
+			continue
+		}
+
+		// Attempt every partition with pending offsets EVERY cycle, not just
+		// ones touched by this specific poll -- see the comment above pending
+		// for why an empty poll must still retry a previously-withheld one.
+		commits := make([]*kgo.Record, 0, len(pending))
+		for tp, highest := range pending {
+			commitOffset := highest
+			if capped, ok := ceiling(tp.topic, tp.partition); ok && capped < highest {
+				commitOffset = capped
+			}
+			if commitOffset < 0 || commitOffset <= committed[tp]-1 {
+				// Either nothing on this partition is safe to commit yet, or
+				// we would be re-committing something already committed --
+				// leave it for a later poll / skip the redundant call.
+				continue
+			}
+			commits = append(commits, &kgo.Record{Topic: tp.topic, Partition: tp.partition, Offset: commitOffset})
+		}
+
+		if len(commits) > 0 {
+			if err := c.client.CommitRecords(ctx, commits...); err != nil && ctx.Err() == nil {
 				c.log.Error("commit offsets failed", slog.String("error", err.Error()))
+			} else if err == nil {
+				for _, rec := range commits {
+					committed[topicPartition{rec.Topic, rec.Partition}] = rec.Offset + 1
+				}
 			}
 		}
 	}
