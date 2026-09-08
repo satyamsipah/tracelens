@@ -175,7 +175,12 @@ services:
       # extra step.
       DEMO_DRIVE_RPS: "5"
     ports:
-      - "8080:8080"
+      # Host 8080 is cmd/query's port (added in phase 3, after this file's
+      # demo services already claimed 8080-8083 for their own admin ports) --
+      # remapped on the host side only; the container's own listener is
+      # still :8080, matching the other demo services' -service flag
+      # convention of "each service's own port on both sides".
+      - "8084:8080"
 
   checkout:
     build: *demo-build
@@ -259,6 +264,34 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+    container_name: tracelens-web
+    depends_on:
+      query: { condition: service_healthy }
+    environment:
+      # Server components (running inside this container) reach the query
+      # API over the compose network; the browser reaches it over localhost,
+      # since it runs outside the compose network entirely -- two different
+      # addresses for the same service, which is why these are two
+      # separate variables rather than one.
+      TRACELENS_API_BASE: http://query:8080
+      NEXT_PUBLIC_API_BASE: http://localhost:8080
+    ports:
+      - "3001:3001"
+    healthcheck:
+      # 127.0.0.1, not localhost: this alpine image resolves "localhost" to
+      # ::1 first, and the server listens on 0.0.0.0 (IPv4) only -- the
+      # exact bug DECISIONS.md already recorded once for ClickHouse's own
+      # healthcheck, recurring here for the same underlying reason.
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3001/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
 
 volumes:
   clickhouse-data:
