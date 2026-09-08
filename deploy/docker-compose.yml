@@ -125,6 +125,34 @@ services:
       retries: 20
       start_period: 15s
 
+  query:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        TARGET: ./cmd/query
+    container_name: tracelens-query
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    environment:
+      TRACELENS_CLICKHOUSE_ADDR: clickhouse:9000
+      TRACELENS_CLICKHOUSE_USER: default
+      TRACELENS_CLICKHOUSE_PASSWORD: tracelens
+      TRACELENS_ADMIN_ADDR: ":9466"
+      TRACELENS_QUERY_HTTP_ADDR: ":8080"
+      TRACELENS_ALERT_RULES_FILE: /etc/tracelens/alerts.yaml
+    volumes:
+      - ./tracelens/alerts.yaml:/etc/tracelens/alerts.yaml:ro
+    ports:
+      - "8080:8080"
+      - "9466:9466"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9466/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
   # ------------------------------------------------------------------ demo --
   # Four containers, one image, one -service flag. The call graph lives in
   # demo/topology.go so the four cannot drift apart.
@@ -216,8 +244,14 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: tracelens
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      # The self-monitoring dashboard's storage-size and compression-ratio
+      # panels query system.parts directly -- that information has no
+      # Prometheus metric behind it, so it needs a second datasource rather
+      # than an invented gauge nothing else in the stack would ever populate.
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
     ports:
       - "3000:3000"
     healthcheck:

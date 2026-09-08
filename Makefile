@@ -101,3 +101,9 @@ compression: ## Report the measured compression ratio per table
 .PHONY: build
 build: ## Build every binary
 	$(GO) build ./...
+
+.PHONY: querybench
+querybench: ## Measure each optimiser pass's effect (bytes read, latency) at real scale
+	TRACELENS_CLICKHOUSE_ADDR=localhost:9000 \
+	TRACELENS_CLICKHOUSE_PASSWORD=tracelens \
+	$(GO) run ./cmd/querybench -rows $(or $(ROWS),10000000) -iters $(or $(ITERS),5)

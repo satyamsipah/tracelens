@@ -186,6 +186,42 @@ type Assembler struct {
 	DrainMaxTemplates int
 }
 
+// Query configures the query engine's HTTP API (cmd/query).
+type Query struct {
+	HTTPAddr   string
+	AdminAddr  string
+	ClickHouse ClickHouse
+	Shutdown   time.Duration
+
+	// QueryTimeout and MaxRowsScanned are the per-query guards internal/query
+	// enforces: a hard wall-clock bound and a preflight EXPLAIN-ESTIMATE
+	// check, respectively -- see internal/query.Options.
+	QueryTimeout   time.Duration
+	MaxRowsScanned uint64
+
+	// AlertRulesFile is optional: if it fails to load, the API still serves
+	// query/explain/trace/service-graph traffic with alerting disabled and a
+	// logged warning, rather than refusing to start entirely -- unlike the
+	// assembler's tail-sampling policy, a missing alert config is a degraded
+	// mode, not "running with no idea what to keep".
+	AlertRulesFile    string
+	AlertEvalInterval time.Duration
+}
+
+// LoadQuery reads query-API configuration from the environment.
+func LoadQuery() Query {
+	return Query{
+		HTTPAddr:          env("TRACELENS_QUERY_HTTP_ADDR", ":8080"),
+		AdminAddr:         env("TRACELENS_ADMIN_ADDR", ":9466"),
+		ClickHouse:        LoadClickHouse(),
+		Shutdown:          envDuration("TRACELENS_SHUTDOWN_TIMEOUT", 15*time.Second),
+		QueryTimeout:      envDuration("TRACELENS_QUERY_TIMEOUT", 30*time.Second),
+		MaxRowsScanned:    uint64(envInt("TRACELENS_QUERY_MAX_ROWS_SCANNED", 50_000_000)),
+		AlertRulesFile:    env("TRACELENS_ALERT_RULES_FILE", "/etc/tracelens/alerts.yaml"),
+		AlertEvalInterval: envDuration("TRACELENS_ALERT_EVAL_INTERVAL", 60*time.Second),
+	}
+}
+
 // LoadGen configures the synthetic span generator.
 type LoadGen struct {
 	Endpoint     string

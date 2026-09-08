@@ -163,6 +163,15 @@ func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceilin
 		failed := false
 		for topic, records := range byTopic {
 			c.m.ConsumeRecords.WithLabelValues(topic).Add(float64(len(records)))
+			// A wall-clock proxy for lag (time since the record was
+			// produced, not yet processed), not an offset-based one --
+			// cheap to compute here (once per topic per poll, from the
+			// batch's own last record) versus the extra round trip
+			// kadm.FetchOffsets would cost on every poll to get a true
+			// high-watermark-minus-committed number.
+			if last := records[len(records)-1]; !last.Timestamp.IsZero() {
+				c.m.ConsumerLagSeconds.WithLabelValues(topic).Set(time.Since(last.Timestamp).Seconds())
+			}
 			if err := handle(ctx, topic, records); err != nil {
 				failed = true
 				c.m.ConsumeErrors.WithLabelValues(topic).Inc()

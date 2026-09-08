@@ -54,8 +54,9 @@ type Metrics struct {
 	BatchSize      *prometheus.HistogramVec
 
 	// ---- kafka consumer ---------------------------------------------------
-	ConsumeRecords *prometheus.CounterVec
-	ConsumeErrors  *prometheus.CounterVec
+	ConsumeRecords     *prometheus.CounterVec
+	ConsumeErrors      *prometheus.CounterVec
+	ConsumerLagSeconds *prometheus.GaugeVec // wall-clock proxy: time since the last-consumed record's own timestamp
 
 	// ---- clickhouse writer ------------------------------------------------
 	RowsInserted     *prometheus.CounterVec
@@ -177,6 +178,10 @@ func NewMetrics() *Metrics {
 		Name: "kafka_consume_errors_total",
 		Help: "Consume errors, by topic.",
 	}, []string{"topic"})
+	m.ConsumerLagSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tracelens_consumer_lag_seconds",
+		Help: "Wall-clock time between a record's own timestamp and when this consumer processed it, by topic. A wall-clock proxy for lag, not an offset-based one.",
+	}, []string{"topic"})
 
 	m.RowsInserted = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "clickhouse_rows_inserted_total",
@@ -292,7 +297,7 @@ func NewMetrics() *Metrics {
 		m.RequestsTotal, m.RequestLatency,
 		m.QueueDepth, m.QueueCapacity,
 		m.ProduceRecords, m.ProduceErrors, m.ProduceLatency, m.BatchSize,
-		m.ConsumeRecords, m.ConsumeErrors,
+		m.ConsumeRecords, m.ConsumeErrors, m.ConsumerLagSeconds,
 		m.RowsInserted, m.InsertBatches, m.InsertErrors, m.InsertRetries,
 		m.InsertLatency, m.InsertQueueDepth,
 		m.InflightTraces, m.InflightBytes, m.ForcedDecisionsTotal, m.EvictedTracesTotal,

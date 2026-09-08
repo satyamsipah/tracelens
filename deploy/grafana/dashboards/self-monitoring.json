@@ -1,0 +1,122 @@
+{
+  "uid": "tracelens-self-monitoring",
+  "title": "TraceLens Self-Monitoring",
+  "description": "TraceLens ingests its own telemetry: ingestion rate, queue depths, drops, sampler memory, consumer lag, storage size, and compression ratio.",
+  "tags": ["tracelens"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingestion rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(otlp_spans_received_total[1m])", "legendFormat": "spans/sec" },
+        { "refId": "B", "expr": "rate(otlp_logs_received_total[1m])", "legendFormat": "logs/sec" },
+        { "refId": "C", "expr": "rate(otlp_metric_points_received_total[1m])", "legendFormat": "metric points/sec" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Queue depth vs capacity",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "ingest_queue_depth", "legendFormat": "depth {{signal}}" },
+        { "refId": "B", "expr": "ingest_queue_capacity", "legendFormat": "capacity {{signal}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Drops, by signal and reason",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (reason) (rate(otlp_spans_dropped_total[5m]))", "legendFormat": "spans: {{reason}}" },
+        { "refId": "B", "expr": "sum by (reason) (rate(otlp_logs_dropped_total[5m]))", "legendFormat": "logs: {{reason}}" },
+        { "refId": "C", "expr": "sum by (reason) (rate(otlp_metric_points_dropped_total[5m]))", "legendFormat": "metrics: {{reason}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Tail sampler memory (in-flight trace buffer)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [
+        { "matcher": { "id": "byName", "options": "in-flight bytes" }, "properties": [{ "id": "unit", "value": "bytes" }] },
+        { "matcher": { "id": "byName", "options": "in-flight traces" }, "properties": [{ "id": "unit", "value": "short" }] }
+      ] },
+      "targets": [
+        { "refId": "A", "expr": "tracelens_inflight_traces", "legendFormat": "in-flight traces" },
+        { "refId": "B", "expr": "tracelens_inflight_bytes", "legendFormat": "in-flight bytes" },
+        { "refId": "C", "expr": "rate(tracelens_forced_decisions_total[5m])", "legendFormat": "forced decisions/sec" },
+        { "refId": "D", "expr": "rate(tracelens_evicted_traces_total[5m])", "legendFormat": "evicted traces/sec" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Consumer lag (wall-clock proxy, by topic)",
+      "description": "time.Since(record.Timestamp) at consume time, not an offset-based lag -- see internal/pipeline.Consumer.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "tracelens_consumer_lag_seconds", "legendFormat": "{{topic}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Log templating and cardinality control",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "tracelens_log_templates_total", "legendFormat": "distinct templates" },
+        { "refId": "B", "expr": "sum by (key) (tracelens_cardinality_breaches_total)", "legendFormat": "breaches: {{key}}" },
+        { "refId": "C", "expr": "topk(5, tracelens_cardinality_estimate)", "legendFormat": "top offenders: {{key}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Storage size, by table (active parts)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": 1,
+          "rawSql": "SELECT table, formatReadableSize(sum(bytes_on_disk)) AS size_on_disk, sum(rows) AS rows FROM system.parts WHERE active AND database = 'tracelens' GROUP BY table ORDER BY sum(bytes_on_disk) DESC"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Compression ratio, by table (measured, not assumed)",
+      "description": "Mirrors the metric make compression prints -- see docs/DECISIONS.md Sec 3 for why this reads system.parts rather than system.columns (the latter can report zero on a small/fresh table).",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": 1,
+          "rawSql": "SELECT table, sum(data_uncompressed_bytes) AS raw_bytes, sum(bytes_on_disk) AS compressed_bytes, round(sum(data_uncompressed_bytes) / greatest(sum(bytes_on_disk), 1), 2) AS ratio FROM system.parts WHERE active AND database = 'tracelens' GROUP BY table ORDER BY table"
+        }
+      ]
+    }
+  ]
+}
