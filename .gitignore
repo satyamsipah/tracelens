@@ -1,0 +1,13 @@
+.env
+.env.*
+.claude/settings.local.json
+CLAUDE.local.md
+/bin
+/tmp
+/data
+node_modules/
+.next/
+.DS_Store
+*.test
+coverage.out
+*.parquet
