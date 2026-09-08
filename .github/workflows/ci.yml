@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Floor set by golang.org/x/sync and genproto/googleapis/rpc, which go.mod
+  # inherits.
+  GO_VERSION: "1.25"
+
+jobs:
+  build:
+    name: build and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l ./cmd ./demo ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+          args: --timeout=5m
+
+  test:
+    name: race tests with testcontainers
+    runs-on: ubuntu-latest
+    # Container startup dominates: ClickHouse and Redpanda each take tens of
+    # seconds before they accept queries.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Pull ahead of the run so a slow registry does not eat the per-test
+      # container wait budget.
+      - name: pre-pull test images
+        run: |
+          docker pull clickhouse/clickhouse-server:24.8-alpine &
+          docker pull redpandadata/redpanda:v24.2.7 &
+          wait
+
+      - name: go test -race
+        run: go test -race -timeout 20m ./...
+
+  bench:
+    name: hot-path benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Not a gate: shared CI runners are far too noisy for a wall-clock
+      # regression threshold. This publishes allocs/op and B/op into the job
+      # log so a hot-path change's allocation cost is reviewable in the PR.
+      - name: go test -bench
+        run: go test -run '^$' -bench . -benchmem ./internal/ingest/... | tee bench.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench.txt
+
+  compose:
+    name: docker compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Definition of Done says `docker compose up` must work from
+      # scratch, so CI proves it rather than trusting it.
+      - name: compose up
+        run: docker compose -f deploy/docker-compose.yml up -d --build --wait
+
+      - name: wait for spans to reach clickhouse
+        run: |
+          for i in $(seq 1 60); do
+            count=$(docker exec tracelens-clickhouse clickhouse-client \
+              --password tracelens \
+              --query "SELECT count() FROM tracelens.spans" 2>/dev/null || echo 0)
+            echo "attempt $i: $count spans"
+            if [ "$count" -gt 0 ] 2>/dev/null; then
+              echo "end-to-end pipeline confirmed with $count spans"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "no spans reached clickhouse"
+          docker compose -f deploy/docker-compose.yml logs --tail=100
+          exit 1
+
+      - name: dump diagnostics on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs --tail=200
+
+      - name: compose down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v --remove-orphans

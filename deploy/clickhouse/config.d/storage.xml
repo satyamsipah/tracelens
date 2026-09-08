@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  Two-volume storage policy backing the "TO VOLUME 'cold'" TTL clauses.
+
+  Locally both volumes sit on the same underlying mount, so this buys no real
+  IO separation. What it buys is that the schema is IDENTICAL in dev, in the
+  Testcontainers test run, and in a deployment where "cold" is genuinely
+  cheaper storage. Testing a different schema than you run is exactly how
+  storage bugs escape, so this file is mounted into the test container too
+  (see internal/storage/testenv_test.go).
+
+  Note for editors: XML forbids a double hyphen inside a comment. ClickHouse
+  refuses to start on a malformed config file rather than ignoring it.
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <hot>
+                <path>/var/lib/clickhouse/hot/</path>
+            </hot>
+            <cold>
+                <path>/var/lib/clickhouse/cold/</path>
+            </cold>
+        </disks>
+        <policies>
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>hot</disk>
+                    </hot>
+                    <cold>
+                        <disk>cold</disk>
+                    </cold>
+                </volumes>
+            </tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

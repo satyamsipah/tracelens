@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Every pipeline stage exports received / dropped / errored / queue depth /
+  # latency, so a single scrape shows where telemetry is being lost.
+  - job_name: collector
+    static_configs:
+      - targets: ["collector:9464"]
+
+  - job_name: assembler
+    static_configs:
+      - targets: ["assembler:9465"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
