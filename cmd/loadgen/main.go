@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -66,6 +68,21 @@ func run(log *slog.Logger, cfg config.LoadGen, endpoint string, rate int, durati
 	var sent, rejected, failed atomic.Int64
 	start := time.Now()
 
+	// Export-call latency, for the p50/p95/p99 the benchmark brief asks
+	// for. One sample per Export RPC (one trace), not per span -- sorting
+	// happens once at the end, so this stays a plain mutex-guarded slice
+	// rather than needing a streaming quantile structure: even at the
+	// highest realistic loadgen rate this is at most a few hundred thousand
+	// samples for a short run, and appending is not the hot path OTLP
+	// export latency itself dominates.
+	var latMu sync.Mutex
+	var latencies []time.Duration
+	recordLatency := func(d time.Duration) {
+		latMu.Lock()
+		latencies = append(latencies, d)
+		latMu.Unlock()
+	}
+
 	// Pace by span budget rather than by trace count: trace sizes vary by two
 	// orders of magnitude, so a per-trace tick would make the actual span rate
 	// swing wildly around the target.
@@ -105,12 +122,15 @@ loop:
 			req := &coltracepb.ExportTraceServiceRequest{ResourceSpans: resourceSpans}
 
 			sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			reqStart := time.Now()
 			_, err := client.Export(sendCtx, req)
+			reqLatency := time.Since(reqStart)
 			cancel()
 
 			switch {
 			case err == nil:
 				sent.Add(int64(spans))
+				recordLatency(reqLatency)
 			case status.Code(err) == codes.ResourceExhausted:
 				// The collector is applying backpressure exactly as designed.
 				// Backing off here is what makes rejection a deferral rather
@@ -132,11 +152,32 @@ loop:
 	}
 
 	elapsed := time.Since(start)
+	p50, p95, p99 := latencyPercentiles(latencies)
 	log.Info("loadgen finished",
 		slog.Int64("spans_sent", sent.Load()),
 		slog.Int64("spans_rejected_backpressure", rejected.Load()),
 		slog.Int64("spans_failed", failed.Load()),
 		slog.String("elapsed", elapsed.Round(time.Millisecond).String()),
-		slog.Float64("effective_spans_per_sec", float64(sent.Load())/elapsed.Seconds()))
+		slog.Float64("effective_spans_per_sec", float64(sent.Load())/elapsed.Seconds()),
+		slog.String("export_latency_p50", p50.Round(time.Millisecond).String()),
+		slog.String("export_latency_p95", p95.Round(time.Millisecond).String()),
+		slog.String("export_latency_p99", p99.Round(time.Millisecond).String()))
 	return nil
+}
+
+// latencyPercentiles sorts once and reads off p50/p95/p99 by rank -- fine
+// for a one-shot end-of-run report; a streaming quantile sketch would only
+// be worth it if this needed to report percentiles continuously during the
+// run, which it does not.
+func latencyPercentiles(samples []time.Duration) (p50, p95, p99 time.Duration) {
+	if len(samples) == 0 {
+		return 0, 0, 0
+	}
+	sorted := append([]time.Duration(nil), samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	at := func(p float64) time.Duration {
+		idx := int(p * float64(len(sorted)-1))
+		return sorted[idx]
+	}
+	return at(0.50), at(0.95), at(0.99)
 }
