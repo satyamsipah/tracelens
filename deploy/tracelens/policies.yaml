@@ -1,0 +1,45 @@
+# Tail-sampling policy chain, evaluated top to bottom. The first policy that
+# does not abstain wins -- see internal/sampling/policy.go. Hot-reloaded: the
+# assembler polls this file's mtime every TRACELENS_RELOAD_INTERVAL (default
+# 5s) and swaps the live chain on a valid change. An invalid edit is logged
+# and the previous chain stays active -- it never crashes the assembler or
+# silently disables sampling.
+
+policies:
+  # Every error is kept, with certainty. An error you always keep is not a
+  # sample of the error population, it IS the error population -- weight 1,
+  # no upweighting.
+  - type: always_sample_errors
+
+  # Every trace slower than 500ms is kept, with certainty, for the same
+  # reason: a fixed latency SLO threshold is a deterministic keep, not a
+  # sample.
+  - type: always_sample_slow
+    mode: threshold
+    threshold: 500ms
+
+  # Always keep traces explicitly flagged for debugging -- BEFORE the rate
+  # cap below, deliberately: this must bypass the cap entirely, not merely
+  # get first crack at it. Placing it after rate_limiting would let an
+  # exhausted bucket veto a debug-flagged trace, breaking the "regardless of
+  # the baseline rate" promise below.
+  - type: attribute_match
+    key: debug.force_sample
+    value: "true"
+
+  # A hard ceiling of 200 traces/sec admitted by this stage, per service.
+  # rate_limiting ABSTAINS while capacity is available -- it does not itself
+  # decide Sample -- so on healthy load this defers straight through to
+  # probabilistic below; it only actively intervenes (Drop, with certainty)
+  # once genuinely exhausted, capping "whatever's left" rather than
+  # competing with the deterministic keeps above it.
+  - type: rate_limiting
+    rate_per_second: 200
+
+  # The baseline: whatever reaches here is normal, fast, non-error traffic
+  # that the rate cap still had room for. Sampled deterministically by
+  # trace_id at a fixed rate. MUST be the last entry -- an empty chain (or
+  # one where nothing matches) is treated as a drop, not a silent 100% keep,
+  # so leaving this out would silently discard all ordinary traffic.
+  - type: probabilistic
+    rate: 0.05

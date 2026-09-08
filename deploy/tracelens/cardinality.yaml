@@ -1,0 +1,47 @@
+# Per-attribute-key cardinality budgets (CLAUDE.md principle 4). Estimated
+# via HyperLogLog per key, not an exact set -- an exact set's memory grows
+# linearly with true cardinality, which is exactly the problem this file
+# exists to bound. See internal/sampling/cardinality.go.
+#
+# `default` applies to any attribute key with no explicit entry below.
+# `action` is one of: drop, bucket, keep_and_alert.
+
+default:
+  budget: 10000
+  action: bucket
+  buckets: 256
+
+overrides:
+  # Route/endpoint identifiers: legitimately high-cardinality if a service
+  # bakes ids into the path (e.g. /orders/12345), but usually has a real
+  # bounded set of TEMPLATED routes -- bucket rather than drop, so unusually
+  # high-cardinality route reporting is still visible as "many buckets in
+  # use" rather than vanishing outright.
+  http.route:
+    budget: 500
+    action: bucket
+    buckets: 128
+
+  # A raw user/session identifier carries no useful aggregate signal once it
+  # is this high-cardinality -- bucketing a UUID buys almost nothing over
+  # dropping it, so drop is simpler and equally informative here.
+  user.id:
+    budget: 100000
+    action: drop
+
+  session.id:
+    budget: 100000
+    action: drop
+
+  # PII-shaped keys: drop outright rather than bucket, which would still
+  # leak set-membership information (repeat visits to the same bucket).
+  customer.email:
+    budget: 1000
+    action: drop
+
+  # A genuinely small, closed set in the demo topology -- kept low so a
+  # regression (e.g. a new service accidentally emitting a per-request value
+  # under this key) is caught immediately rather than silently absorbed.
+  service.name:
+    budget: 50
+    action: keep_and_alert

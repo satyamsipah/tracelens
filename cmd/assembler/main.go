@@ -1,9 +1,10 @@
-// Command assembler consumes Redpanda and writes to ClickHouse.
+// Command assembler consumes Redpanda, assembles traces, makes tail-sampling
+// decisions, templates logs, and writes to ClickHouse.
 //
-// In this phase it is a straight decode-and-store stage. The trace assembly
-// and tail-sampling logic that gives it its name arrives in phase 2, and it
-// lands here precisely because trace_id partitioning already guarantees that
-// one instance sees every span of a trace.
+// This is where trace_id partitioning (phase 1) pays off: because every span
+// of a trace is guaranteed to land on the partition this process (or another
+// replica of it) owns, the in-flight trace buffer below can safely hold
+// per-trace state in local memory without ever seeing a fragment.
 package main
 
 import (
@@ -23,8 +24,10 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/satyamsipah/tracelens/internal/config"
+	"github.com/satyamsipah/tracelens/internal/logs"
 	"github.com/satyamsipah/tracelens/internal/observability"
 	"github.com/satyamsipah/tracelens/internal/pipeline"
+	"github.com/satyamsipah/tracelens/internal/sampling"
 	"github.com/satyamsipah/tracelens/internal/storage"
 )
 
@@ -59,21 +62,80 @@ func run(log *slog.Logger) error {
 	writer.Start(ctx)
 	defer writer.Close()
 
+	// Policy chain and cardinality budgets are loaded eagerly and fail
+	// startup on error -- an assembler silently running with no sampling
+	// policy or no cardinality control would be a far worse failure mode
+	// than refusing to start.
+	chain, err := sampling.LoadPolicyFileWithMetrics(cfg.PolicyFile, metrics)
+	if err != nil {
+		return fmt.Errorf("load policy file %s: %w", cfg.PolicyFile, err)
+	}
+	cardinalityCfg, err := sampling.LoadCardinalityFile(cfg.CardinalityFile)
+	if err != nil {
+		return fmt.Errorf("load cardinality file %s: %w", cfg.CardinalityFile, err)
+	}
+	cardinalityGuard := sampling.NewCardinalityGuard(cardinalityCfg, metrics)
+
+	eviction := sampling.EvictionForcedDecision
+	if cfg.BufferEviction == string(sampling.EvictionDiscard) {
+		eviction = sampling.EvictionDiscard
+	}
+	buffer := sampling.NewBuffer(sampling.BufferConfig{
+		MaxTraces:        cfg.BufferMaxTraces,
+		MaxBytes:         cfg.BufferMaxBytes,
+		Eviction:         eviction,
+		DecisionWait:     cfg.DecisionWait,
+		DecidedCacheSize: cfg.DecidedCacheSize,
+		DecidedCacheTTL:  cfg.DecidedCacheTTL,
+	}, metrics)
+
+	h := &handler{cfg: cfg, writer: writer, log: log, cardinality: cardinalityGuard}
+
+	assembler := sampling.NewAssembler(buffer, chain, metrics, log, h.emitDecidedTrace, h.attachLateSpan)
+	h.assembler = assembler
+
+	drainTree := logs.NewTree(logs.Config{
+		Depth:               cfg.DrainDepth,
+		SimilarityThreshold: cfg.DrainSimilarity,
+		MaxChildren:         cfg.DrainMaxChildren,
+		MaxTemplates:        cfg.DrainMaxTemplates,
+		// Bounds one leaf's similarity-scan cost independent of the
+		// tree-wide cap above -- see Config.MaxClustersPerLeaf's doc
+		// comment for the measured 138x cost this prevents.
+		MaxClustersPerLeaf: 200,
+	}, metrics)
+	h.templates = logs.NewTemplateStore(drainTree, metrics)
+
 	consumer, err := pipeline.NewConsumer(cfg.Kafka, metrics, log)
 	if err != nil {
 		return err
 	}
 	defer consumer.Close()
 
-	h := &handler{cfg: cfg, writer: writer, log: log}
-
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return consumer.Run(gctx, h.handle) })
+
+	g.Go(func() error {
+		return consumer.RunWithCommitGate(gctx, h.handle, h.commitCeiling)
+	})
 	g.Go(func() error { return admin.Start() })
+
+	sweepStop := make(chan struct{})
+	go assembler.RunSweep(sweepStop, cfg.SweepInterval)
+	defer close(sweepStop)
+
+	reloadStop := make(chan struct{})
+	go sampling.NewPolicyFileWatcherWithMetrics(cfg.PolicyFile, cfg.ReloadInterval, assembler, log, metrics).Run(reloadStop)
+	defer close(reloadStop)
 
 	log.Info("assembler ready",
 		slog.String("group", cfg.Kafka.ConsumerGroup),
-		slog.String("admin", cfg.AdminAddr))
+		slog.String("admin", cfg.AdminAddr),
+		slog.String("policy_file", cfg.PolicyFile),
+		slog.String("cardinality_file", cfg.CardinalityFile),
+		slog.Int("buffer_max_traces", cfg.BufferMaxTraces),
+		slog.Int64("buffer_max_bytes", cfg.BufferMaxBytes),
+		slog.String("eviction_policy", string(eviction)),
+		slog.String("decision_wait", cfg.DecisionWait.String()))
 	admin.SetReady(true)
 
 	<-gctx.Done()
@@ -93,58 +155,137 @@ func run(log *slog.Logger) error {
 	return nil
 }
 
+// handler bridges the Kafka consumer, the trace assembler, the log
+// templater, and the ClickHouse writer.
 type handler struct {
-	cfg    config.Assembler
-	writer *storage.Writer
-	log    *slog.Logger
+	cfg         config.Assembler
+	writer      *storage.Writer
+	log         *slog.Logger
+	assembler   *sampling.Assembler
+	templates   *logs.TemplateStore
+	cardinality *sampling.CardinalityGuard
 }
 
-// handle decodes one poll's records for one topic and writes them.
+// commitCeiling is the pipeline.CommitCeiling the consumer consults before
+// committing. Only the spans topic buffers (and therefore only it can hold a
+// partition's commit back); logs and metrics are written synchronously
+// within handle, exactly as phase 1 did, so they have nothing to gate.
+func (h *handler) commitCeiling(topic string, partition int32) (int64, bool) {
+	if topic != h.cfg.Kafka.TopicSpans {
+		return 0, false
+	}
+	return h.assembler.SafeCommitOffset(partition)
+}
+
+// handle decodes one poll's records for one topic.
 //
-// It returns an error rather than swallowing one, so the consumer withholds
-// the offset commit and the broker redelivers. That is what makes the
-// pipeline at-least-once; the ReplacingMergeTree sort key and the insert
-// dedup token are what stop at-least-once from meaning duplicated rows.
+// For spans, this ONLY decodes and ingests into the assembler -- it does
+// NOT wait for a sampling decision or a storage write, both of which can
+// happen long after this call returns (up to the full decision wait, or
+// longer under capacity pressure). That asynchrony is exactly why offset
+// commits for spans are governed by commitCeiling/the watermark instead of
+// this function's return value.
+//
+// For logs and metrics, behavior is unchanged from phase 1: decode, write,
+// wait for durability, return an error to withhold the whole poll's offsets
+// on failure.
 func (h *handler) handle(ctx context.Context, topic string, records []*kgo.Record) error {
-	flush := storage.NewFlush(batchToken(topic, records))
+	switch topic {
+	case h.cfg.Kafka.TopicSpans:
+		return h.handleSpans(records)
+	case h.cfg.Kafka.TopicLogs:
+		return h.handleLogs(ctx, records)
+	case h.cfg.Kafka.TopicMetrics:
+		return h.handleMetrics(ctx, records)
+	default:
+		return fmt.Errorf("unexpected topic %q", topic)
+	}
+}
+
+func (h *handler) handleSpans(records []*kgo.Record) error {
+	for _, rec := range records {
+		rows, err := storage.DecodeSpans(rec.Value)
+		if err != nil {
+			// A single malformed payload must not stall the partition
+			// forever: log it, skip it, and keep the batch moving.
+			h.log.Error("skipping malformed span record",
+				slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
+			continue
+		}
+		for i := range rows {
+			// Cardinality control at ingest, before the span ever reaches
+			// the trace buffer (CLAUDE.md principle 4).
+			rows[i].SpanAttributes = h.cardinality.ApplyToAttributes(rows[i].SpanAttributes)
+			rows[i].ResourceAttributes = h.cardinality.ApplyToAttributes(rows[i].ResourceAttributes)
+			h.assembler.Ingest(rows[i], rec.Partition, rec.Offset)
+		}
+	}
+	return nil
+}
+
+// emitDecidedTrace is the sampling.EmitFunc: writes a decided trace's spans
+// (already weighted) if sampled, and reports write durability so the
+// assembler knows whether it is safe to resolve the offset watermark.
+// Dropped traces are simply not written -- that is the entire point of tail
+// sampling.
+func (h *handler) emitDecidedTrace(spans []storage.SpanRow, d sampling.Decision) error {
+	h.log.Debug("trace decided",
+		slog.String("outcome", d.Verdict.String()),
+		slog.String("policy", d.PolicyName),
+		slog.Int("spans", len(spans)))
+
+	if d.Verdict != sampling.VerdictSample {
+		return nil
+	}
+
+	flush := storage.NewFlush(spanBatchToken(spans))
+	flush.Spans = spans
+	return h.submitAndWait(flush)
+}
+
+// attachLateSpan is the sampling.LateAttachFunc.
+func (h *handler) attachLateSpan(s storage.SpanRow) error {
+	flush := storage.NewFlush(spanBatchToken([]storage.SpanRow{s}))
+	flush.Spans = []storage.SpanRow{s}
+	return h.submitAndWait(flush)
+}
+
+func (h *handler) submitAndWait(flush *storage.Flush) error {
+	ctx, cancel := context.WithTimeout(context.Background(), h.cfg.ClickHouse.QueryTimeout)
+	defer cancel()
+	if err := h.writer.Submit(ctx, flush); err != nil {
+		return fmt.Errorf("submit flush: %w", err)
+	}
+	return flush.Wait(ctx)
+}
+
+func (h *handler) handleLogs(ctx context.Context, records []*kgo.Record) error {
+	flush := storage.NewFlush(batchToken(h.cfg.Kafka.TopicLogs, records))
+	now := time.Now().UTC()
 
 	for _, rec := range records {
-		switch topic {
-		case h.cfg.Kafka.TopicSpans:
-			rows, err := storage.DecodeSpans(rec.Value)
-			if err != nil {
-				// A single malformed payload must not stall the partition
-				// forever: log it, skip it, and keep the batch moving.
-				h.log.Error("skipping malformed span record",
-					slog.Int64("offset", rec.Offset),
-					slog.String("error", err.Error()))
-				continue
-			}
-			flush.Spans = append(flush.Spans, rows...)
-
-		case h.cfg.Kafka.TopicLogs:
-			rows, err := storage.DecodeLogs(rec.Value)
-			if err != nil {
-				h.log.Error("skipping malformed log record",
-					slog.Int64("offset", rec.Offset),
-					slog.String("error", err.Error()))
-				continue
-			}
-			flush.Logs = append(flush.Logs, rows...)
-
-		case h.cfg.Kafka.TopicMetrics:
-			rows, err := storage.DecodeMetrics(rec.Value)
-			if err != nil {
-				h.log.Error("skipping malformed metric record",
-					slog.Int64("offset", rec.Offset),
-					slog.String("error", err.Error()))
-				continue
-			}
-			flush.Metrics = append(flush.Metrics, rows...)
-
-		default:
-			return fmt.Errorf("unexpected topic %q", topic)
+		rows, err := storage.DecodeLogs(rec.Value)
+		if err != nil {
+			h.log.Error("skipping malformed log record",
+				slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
+			continue
 		}
+		for i := range rows {
+			match, upsert := h.templates.Process(rows[i].Body)
+			rows[i].TemplateID = match.TemplateID
+			rows[i].Params = match.Params
+			rows[i].LogAttributes = h.cardinality.ApplyToAttributes(rows[i].LogAttributes)
+
+			if upsert != nil {
+				flush.Templates = append(flush.Templates, storage.TemplateRow{
+					TemplateID:   upsert.TemplateID,
+					TemplateText: upsert.Text,
+					FirstSeen:    now,
+					UpdatedAt:    now,
+				})
+			}
+		}
+		flush.Logs = append(flush.Logs, rows...)
 	}
 
 	if flush.Empty() {
@@ -156,13 +297,47 @@ func (h *handler) handle(ctx context.Context, topic string, records []*kgo.Recor
 	return flush.Wait(ctx)
 }
 
-// batchToken derives a stable dedup token from the exact set of Kafka records
-// in this batch.
-//
-// Determinism is the whole point: a redelivery after a crash replays the same
-// offsets, produces the same token, and ClickHouse rejects the duplicate
-// insert. Sorting first is required because franz-go groups records by
-// partition in fetch order, which is not stable across polls.
+func (h *handler) handleMetrics(ctx context.Context, records []*kgo.Record) error {
+	flush := storage.NewFlush(batchToken(h.cfg.Kafka.TopicMetrics, records))
+
+	for _, rec := range records {
+		rows, err := storage.DecodeMetrics(rec.Value)
+		if err != nil {
+			h.log.Error("skipping malformed metric record",
+				slog.Int64("offset", rec.Offset), slog.String("error", err.Error()))
+			continue
+		}
+		flush.Metrics = append(flush.Metrics, rows...)
+	}
+
+	if flush.Empty() {
+		return nil
+	}
+	if err := h.writer.Submit(ctx, flush); err != nil {
+		return fmt.Errorf("submit flush: %w", err)
+	}
+	return flush.Wait(ctx)
+}
+
+// spanBatchToken derives a dedup token from the exact set of span/trace
+// identity in this batch, for the insert_deduplication_token phase 1 relies
+// on. Unlike batchToken below (keyed on Kafka offsets, appropriate when a
+// whole poll's records map 1:1 to one flush), a decided trace's flush is NOT
+// tied to a single Kafka offset range -- it is a decision, potentially
+// firing well after the records that fed it were polled -- so the token is
+// derived from the spans' own identity instead.
+func spanBatchToken(spans []storage.SpanRow) string {
+	h := fnv.New64a()
+	for i := range spans {
+		_, _ = h.Write(spans[i].TraceID)
+		_, _ = h.Write(spans[i].SpanID)
+	}
+	return "spans-decided-" + strconv.FormatUint(h.Sum64(), 16)
+}
+
+// batchToken derives a stable dedup token from the exact set of Kafka
+// records in this batch, for topics (logs, metrics) that still write
+// synchronously per poll.
 func batchToken(topic string, records []*kgo.Record) string {
 	type key struct {
 		partition int32

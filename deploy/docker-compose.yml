@@ -105,6 +105,17 @@ services:
       TRACELENS_CLICKHOUSE_USER: default
       TRACELENS_CLICKHOUSE_PASSWORD: tracelens
       TRACELENS_ADMIN_ADDR: ":9465"
+      TRACELENS_POLICY_FILE: /etc/tracelens/policies.yaml
+      TRACELENS_CARDINALITY_FILE: /etc/tracelens/cardinality.yaml
+      # Forced-early-decision, not discard: nothing that enters the trace
+      # buffer is ever thrown away outright, only decided early under
+      # capacity pressure.
+      TRACELENS_BUFFER_EVICTION: forced_decision
+    volumes:
+      # Hot-reloadable: the assembler polls these for changes every
+      # TRACELENS_RELOAD_INTERVAL without a restart.
+      - ./tracelens/policies.yaml:/etc/tracelens/policies.yaml:ro
+      - ./tracelens/cardinality.yaml:/etc/tracelens/cardinality.yaml:ro
     ports:
       - "9465:9465"
     healthcheck:

@@ -155,12 +155,35 @@ type ClickHouse struct {
 	RetryMaxDelay  time.Duration
 }
 
-// Assembler configures the Kafka -> ClickHouse process.
+// Assembler configures the Kafka -> ClickHouse process, including the trace
+// assembler / tail sampler and the log templating pipeline.
 type Assembler struct {
 	AdminAddr  string
 	Kafka      Kafka
 	ClickHouse ClickHouse
 	Shutdown   time.Duration
+
+	// PolicyFile and CardinalityFile are YAML config, hot-reloaded on a
+	// ReloadInterval poll -- see internal/sampling.PolicyFileWatcher.
+	PolicyFile      string
+	CardinalityFile string
+	ReloadInterval  time.Duration
+
+	// In-flight trace buffer bounds (CLAUDE.md principle 2: hard cap,
+	// explicit eviction policy).
+	BufferMaxTraces  int
+	BufferMaxBytes   int64
+	BufferEviction   string // "forced_decision" or "discard"
+	DecisionWait     time.Duration
+	SweepInterval    time.Duration
+	DecidedCacheSize int
+	DecidedCacheTTL  time.Duration
+
+	// Drain (internal/logs) tuning.
+	DrainDepth        int
+	DrainSimilarity   float64
+	DrainMaxChildren  int
+	DrainMaxTemplates int
 }
 
 // LoadGen configures the synthetic span generator.
@@ -201,12 +224,34 @@ func LoadCollector() Collector {
 }
 
 // LoadAssembler reads assembler configuration from the environment.
+//
+// DecisionWait default (5s) and BufferMaxTraces/BufferMaxBytes are sized for
+// the demo workload's traffic, not tuned for a specific production SLA --
+// they are exactly the knobs an operator would adjust for real traffic
+// volume and acceptable trace-completion latency.
 func LoadAssembler() Assembler {
 	return Assembler{
 		AdminAddr:  env("TRACELENS_ADMIN_ADDR", ":9465"),
 		Kafka:      LoadKafka(),
 		ClickHouse: LoadClickHouse(),
 		Shutdown:   envDuration("TRACELENS_SHUTDOWN_TIMEOUT", 30*time.Second),
+
+		PolicyFile:      env("TRACELENS_POLICY_FILE", "/etc/tracelens/policies.yaml"),
+		CardinalityFile: env("TRACELENS_CARDINALITY_FILE", "/etc/tracelens/cardinality.yaml"),
+		ReloadInterval:  envDuration("TRACELENS_RELOAD_INTERVAL", 5*time.Second),
+
+		BufferMaxTraces:  envInt("TRACELENS_BUFFER_MAX_TRACES", 50_000),
+		BufferMaxBytes:   int64(envInt("TRACELENS_BUFFER_MAX_BYTES", 256<<20)),
+		BufferEviction:   env("TRACELENS_BUFFER_EVICTION", "forced_decision"),
+		DecisionWait:     envDuration("TRACELENS_DECISION_WAIT", 5*time.Second),
+		SweepInterval:    envDuration("TRACELENS_SWEEP_INTERVAL", 500*time.Millisecond),
+		DecidedCacheSize: envInt("TRACELENS_DECIDED_CACHE_SIZE", 100_000),
+		DecidedCacheTTL:  envDuration("TRACELENS_DECIDED_CACHE_TTL", 5*time.Minute),
+
+		DrainDepth:        envInt("TRACELENS_DRAIN_DEPTH", 4),
+		DrainSimilarity:   envFloat("TRACELENS_DRAIN_SIMILARITY", 0.6),
+		DrainMaxChildren:  envInt("TRACELENS_DRAIN_MAX_CHILDREN", 100),
+		DrainMaxTemplates: envInt("TRACELENS_DRAIN_MAX_TEMPLATES", 10_000),
 	}
 }
 
