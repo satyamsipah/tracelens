@@ -8,10 +8,11 @@ import (
 
 // Table names, fully qualified. Nothing outside this package spells them.
 const (
-	TableSpans        = "tracelens.spans"
-	TableLogs         = "tracelens.logs"
-	TableMetrics      = "tracelens.metrics"
-	TableLogTemplates = "tracelens.log_templates"
+	TableSpans           = "tracelens.spans"
+	TableLogs            = "tracelens.logs"
+	TableMetrics         = "tracelens.metrics"
+	TableLogTemplates    = "tracelens.log_templates"
+	TableServiceEdgesRaw = "tracelens.service_edges_raw"
 )
 
 // SpanRow mirrors tracelens.spans one-for-one, in declaration order. The
@@ -83,6 +84,19 @@ type TemplateRow struct {
 	UpdatedAt    time.Time
 }
 
+// ServiceEdgeRow mirrors tracelens.service_edges_raw: one pre-joined
+// caller->callee observation per cross-service span. See
+// internal/sampling.ExtractServiceEdges for why the join happens in Go
+// rather than in ClickHouse.
+type ServiceEdgeRow struct {
+	Timestamp      time.Time
+	CallerService  string
+	CalleeService  string
+	DurationNS     uint64
+	IsError        bool
+	SamplingWeight float64
+}
+
 const (
 	insertSpans = "INSERT INTO tracelens.spans (" +
 		"timestamp, trace_id, span_id, parent_span_id, service_name, span_name, span_kind, " +
@@ -99,6 +113,9 @@ const (
 
 	insertLogTemplates = "INSERT INTO tracelens.log_templates (" +
 		"template_id, template_text, first_seen, updated_at)"
+
+	insertServiceEdges = "INSERT INTO tracelens.service_edges_raw (" +
+		"timestamp, caller_service, callee_service, duration_ns, is_error, sampling_weight)"
 )
 
 // fixedBytes pads or truncates to exactly n bytes.

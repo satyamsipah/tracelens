@@ -21,10 +21,11 @@ var ErrWriterClosed = errors.New("storage writer closed")
 // Flush is one unit of work for the writer: the rows decoded from one Kafka
 // poll, plus the token that makes re-inserting them harmless.
 type Flush struct {
-	Spans     []SpanRow
-	Logs      []LogRow
-	Metrics   []MetricRow
-	Templates []TemplateRow
+	Spans        []SpanRow
+	Logs         []LogRow
+	Metrics      []MetricRow
+	Templates    []TemplateRow
+	ServiceEdges []ServiceEdgeRow
 
 	// Token is derived from the Kafka topic, partition and offset range, so a
 	// redelivered batch produces the IDENTICAL token and ClickHouse discards
@@ -42,8 +43,10 @@ func NewFlush(token string) *Flush {
 	return &Flush{Token: token, done: make(chan error, 1)}
 }
 
-// Rows reports the total row count across all four tables.
-func (f *Flush) Rows() int { return len(f.Spans) + len(f.Logs) + len(f.Metrics) + len(f.Templates) }
+// Rows reports the total row count across every table.
+func (f *Flush) Rows() int {
+	return len(f.Spans) + len(f.Logs) + len(f.Metrics) + len(f.Templates) + len(f.ServiceEdges)
+}
 
 // Empty reports whether there is nothing to write.
 func (f *Flush) Empty() bool { return f.Rows() == 0 }
@@ -181,6 +184,11 @@ func (w *Writer) write(ctx context.Context, f *Flush) error {
 			return err
 		}
 	}
+	if len(f.ServiceEdges) > 0 {
+		if err := w.insertServiceEdges(ctx, f); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -266,6 +274,30 @@ func (w *Writer) insertTemplates(ctx context.Context, f *Flush) error {
 		}
 		return nil
 	}, insertLogTemplates)
+}
+
+// insertServiceEdges writes pre-joined caller->callee observations extracted
+// from a decided trace's tree (internal/sampling.ExtractServiceEdges). Uses
+// f.Token like spans/logs/metrics -- a redelivered decided-trace flush must
+// not double-count call volume in the service graph any more than it may
+// double-count spans.
+func (w *Writer) insertServiceEdges(ctx context.Context, f *Flush) error {
+	return w.runInsert(ctx, TableServiceEdgesRaw, f.Token, len(f.ServiceEdges), func(batch driver.Batch) error {
+		for i := range f.ServiceEdges {
+			r := &f.ServiceEdges[i]
+			var isError uint8
+			if r.IsError {
+				isError = 1
+			}
+			if err := batch.Append(
+				r.Timestamp, r.CallerService, r.CalleeService,
+				r.DurationNS, isError, r.SamplingWeight,
+			); err != nil {
+				return fmt.Errorf("append service edge row %d: %w", i, err)
+			}
+		}
+		return nil
+	}, insertServiceEdges)
 }
 
 func (w *Writer) runInsert(ctx context.Context, table, token string, rows int, fill func(driver.Batch) error, query string) error {

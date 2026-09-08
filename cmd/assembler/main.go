@@ -240,7 +240,35 @@ func (h *handler) emitDecidedTrace(spans []storage.SpanRow, d sampling.Decision)
 
 	flush := storage.NewFlush(spanBatchToken(spans))
 	flush.Spans = spans
+	flush.ServiceEdges = serviceEdgeRows(spans, d.Weight())
 	return h.submitAndWait(flush)
+}
+
+// serviceEdgeRows rebuilds the span tree (already computed once inside
+// sampling.decide for the policy chain, but not threaded through EmitFunc --
+// rebuilding here is cheap relative to a network write, and keeps EmitFunc's
+// signature stable) and extracts one row per cross-service call for the
+// service dependency graph. See internal/sampling.ExtractServiceEdges for
+// why this join has to happen here, in Go, rather than as a ClickHouse
+// materialized view.
+func serviceEdgeRows(spans []storage.SpanRow, weight float64) []storage.ServiceEdgeRow {
+	tree := sampling.BuildTree(spans)
+	edges := sampling.ExtractServiceEdges(tree, weight)
+	if len(edges) == 0 {
+		return nil
+	}
+	rows := make([]storage.ServiceEdgeRow, len(edges))
+	for i, e := range edges {
+		rows[i] = storage.ServiceEdgeRow{
+			Timestamp:      e.Timestamp,
+			CallerService:  e.Caller,
+			CalleeService:  e.Callee,
+			DurationNS:     e.DurationNS,
+			IsError:        e.IsError,
+			SamplingWeight: e.Weight,
+		}
+	}
+	return rows
 }
 
 // attachLateSpan is the sampling.LateAttachFunc.
