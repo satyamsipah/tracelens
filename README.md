@@ -4,8 +4,9 @@ An OpenTelemetry-compatible observability platform: telemetry ingestion,
 columnar storage, tail-based sampling, and a query engine for distributed
 traces, logs and metrics.
 
-**Current phase: ingestion, storage, and a demo workload.** Tail sampling and
-the query engine are not implemented yet — see [Roadmap](#roadmap).
+**Current phase: ingestion, storage, tail-based sampling, and the log
+pipeline.** The query engine and UI are not implemented yet — see
+[Roadmap](#roadmap).
 
 ---
 
@@ -21,7 +22,8 @@ Instrumented apps ──OTLP gRPC:4317 / HTTP:4318──▶ collector
                                                      │
                                                      ▼
                                                  assembler
-                                          decode ▶ batch ▶ retry ▶ insert
+                             spans:  buffer by trace_id ▶ tail-sample ▶ insert
+                             logs:   Drain templating ▶ cardinality guard ▶ insert
                                                      │
                                                      ▼
                                         ClickHouse (explicit codecs, TTL tiering)
@@ -110,7 +112,9 @@ make down
 | `cmd/loadgen` | Synthetic span generator |
 | `cmd/migrate` | Standalone schema migration runner |
 | `internal/ingest` | OTLP transports, splitting, bounded queue, batching |
-| `internal/pipeline` | Kafka producer/consumer, topic management |
+| `internal/pipeline` | Kafka producer/consumer, commit-gated offset tracking |
+| `internal/sampling` | Trace buffer, policy chain, router, cardinality guard |
+| `internal/logs` | Drain template extraction, template dictionary |
 | `internal/storage` | ClickHouse schema, migrations, decoding, async writer |
 | `internal/observability` | Prometheus registry, admin server, logging |
 | `demo/` | Four instrumented services in one binary |
@@ -147,6 +151,128 @@ one fails CI rather than review.
 independent schema review against this same live data found and fixed two
 issues: an index that pruned zero granules, and a codec that was quietly
 *inflating* its column — see [docs/DECISIONS.md §3a](docs/DECISIONS.md).
+
+---
+
+## Tail sampling
+
+Spans arrive out of order and never all at once, so the assembler buffers
+in-flight spans per `trace_id` and decides, later, what to keep.
+
+**Completion heuristic: fixed wait + root-closure early exit.** Every trace
+gets `TRACELENS_DECISION_WAIT` (default 5s) from first-seen before a periodic
+sweep (`RunSweep`) forces a decision — but if the root span has already
+arrived and every buffered span's interval falls inside
+`[root.start, root.end]`, the trace decides immediately rather than waiting
+out the timer. A quiet-period heuristic (reset the timer on every new span)
+and a pure root-seen+grace heuristic were considered and rejected — see
+[docs/DECISIONS.md](docs/DECISIONS.md) for why a fixed ceiling with an early
+exit was chosen over both.
+
+**Buffer eviction: forced early decision, not discard.** The in-flight
+buffer is bounded by both trace count (`TRACELENS_BUFFER_MAX_TRACES`, default
+50,000) and bytes (`TRACELENS_BUFFER_MAX_BYTES`, default 256MiB). At
+capacity, the oldest trace is forced through the policy chain immediately —
+on whatever spans it has so far — rather than silently discarded, because a
+discarded trace under load is indistinguishable from a trace that was never
+sampled, while a forced decision is at least visible as
+`tracelens_forced_decisions_total`.
+
+**Policy chain — composable, ordered, hot-reloadable.** Policies evaluate in
+order; the first that doesn't abstain wins (`internal/sampling/policy.go`).
+The deployed chain ([`deploy/tracelens/policies.yaml`](deploy/tracelens/policies.yaml)):
+
+1. `always_sample_errors` — any error span, kept with certainty
+2. `always_sample_slow` — latency over a threshold (or above a rolling p99),
+   kept with certainty
+3. `attribute_match` — an explicit debug flag, kept with certainty,
+   **before** the rate cap so it truly bypasses it
+4. `rate_limiting` — a per-service token-bucket ceiling; **abstains** while
+   capacity remains (deferring to probabilistic below) and only vetoes once
+   exhausted — this composability fix mattered: an earlier version always
+   resolved with a smoothed weight, which silently made `probabilistic` and
+   `attribute_match` dead code (see DECISIONS.md)
+5. `probabilistic` — the baseline, a fixed rate sampled deterministically by
+   `trace_id`; must be last, since an empty/no-match chain drops rather than
+   silently keeping everything
+
+The assembler polls the policy file's mtime every
+`TRACELENS_RELOAD_INTERVAL` (default 5s) and swaps the live chain on a valid
+change; a malformed edit is logged and the previous chain stays active.
+
+**Sampling weight.** Every kept trace carries `Decision.Weight() =
+1/Probability`, so a downstream aggregate can recover the true population
+rate rather than just the sampled count — verified by
+`TestUpweightingRecoversTruePopulation`, which generates a known population,
+samples it, and checks the weighted aggregate against ground truth (within
+~5% at a 1% sampling rate over 100k traces).
+
+**Routing.** Spans are partitioned by `trace_id`, and `internal/sampling/router.go`
+implements genuine consistent hashing (rendezvous / HRW, not `hash%N`) for a
+future multi-assembler topology — resize adds/removes only ~20% of key
+assignments versus 75%+ for naive modulo sharding. It is not yet wired into
+the live consume path; partitioning today comes from the Kafka consumer
+group itself. `TestConsumerNoTraceSplitAcrossThreeInstances` runs three real
+consumer instances against a live Redpanda topic and asserts no trace_id is
+ever observed by more than one instance.
+
+**Late spans.** A span for an already-decided trace is attached to storage
+if that trace was sampled (carrying the original decision's weight), and
+dropped with `tracelens_late_spans_total{outcome="dropped"}` otherwise. A
+small decided-trace cache (bounded, LRU-evicted) makes this possible without
+re-buffering.
+
+**Commit safety.** `internal/sampling/watermark.go` tracks, per partition,
+the earliest offset of any trace not yet durably decided, and the consumer
+(`RunWithCommitGate`) never commits past it — so a crash mid-decision
+replays exactly the undecided traces, and nothing already flushed is
+re-processed.
+
+---
+
+## Log pipeline
+
+**Template extraction: Drain, implemented from scratch** (`internal/logs/drain.go`,
+no external library). A fixed-depth tree groups log lines first by token
+count, then by leading tokens; numeric-looking tokens are wildcarded eagerly
+during descent (`user_id=482913` and `user_id=17` reach the same leaf); the
+leaf does a position-wise similarity match against existing clusters and
+only ever widens a template, never narrows it. `Config{Depth,
+SimilarityThreshold, MaxChildren, MaxTemplates, MaxClustersPerLeaf}` are all
+tunable (`TRACELENS_DRAIN_*`).
+
+Only `template_id` + extracted `params` are stored per log line; the
+rendered text lives once in a `log_templates` dictionary table, upserted
+only when a template is newly created or widened. Measured on a 10,000-line
+corpus: raw bodies 783,425 bytes vs. templated 283,408 bytes — a **2.76×**
+storage reduction (`TestTemplateStoreMeasuresStorageSaving`). The number of
+distinct templates is bounded both tree-wide and per-leaf
+(`MaxClustersPerLeaf`, default 200 in production), LRU-evicting the
+coldest template rather than growing unbounded — a load test found a 138×
+slowdown with no per-leaf cap, resolved to 6.5× after (see DECISIONS.md).
+
+**Cardinality control** uses a HyperLogLog per attribute key
+(`internal/sampling/hyperloglog.go`) — an approximate sketch, deliberately
+not an exact set, so tracking cardinality never itself becomes an unbounded
+memory cost. Each key has a configurable budget
+([`deploy/tracelens/cardinality.yaml`](deploy/tracelens/cardinality.yaml))
+and a breach action:
+
+- **`drop`** — strip the attribute entirely once its key exceeds budget
+- **`bucket`** *(default)* — hash the value into a fixed number of buckets,
+  keeping the attribute queryable at reduced granularity instead of losing
+  it
+- **`keep_and_alert`** — keep the value as-is but count the breach, for keys
+  where cardinality is a symptom to investigate rather than a cost to cap
+
+Every breach increments `tracelens_cardinality_breaches_total{key}`, and the
+live estimate is exported as `tracelens_cardinality_estimate{key}`, together
+forming the "top offenders" panel in Grafana.
+
+**Correlation and retention.** Logs carry `trace_id`/`span_id` when present,
+joinable against `spans` in the query engine. Retention is TTL'd by
+severity, not a single flat window: TRACE/DEBUG for 1 day, INFO/WARN for 14
+days, ERROR/FATAL for 90 days (`internal/storage/migrations/0006_log_templates.up.sql`).
 
 ---
 
@@ -197,12 +323,24 @@ nothing set. The knobs that matter:
 | `TRACELENS_BATCH_FLUSH_INTERVAL` | `200ms` | Flush trigger — time |
 | `TRACELENS_KAFKA_PARTITIONS` | `12` | **Fixed by design** — changing it rehashes every key |
 | `TRACELENS_CLICKHOUSE_BATCH_SIZE` | `10000` | Rows per INSERT |
+| `TRACELENS_POLICY_FILE` | `/etc/tracelens/policies.yaml` | Tail-sampling policy chain, hot-reloaded |
+| `TRACELENS_CARDINALITY_FILE` | `/etc/tracelens/cardinality.yaml` | Per-key cardinality budgets and actions |
+| `TRACELENS_RELOAD_INTERVAL` | `5s` | Policy-file mtime poll interval |
+| `TRACELENS_DECISION_WAIT` | `5s` | Fixed-wait ceiling before a trace is force-decided |
+| `TRACELENS_BUFFER_MAX_TRACES` | `50000` | In-flight buffer cap, trace count |
+| `TRACELENS_BUFFER_MAX_BYTES` | `256MiB` | In-flight buffer cap, bytes |
+| `TRACELENS_BUFFER_EVICTION` | `forced_decision` | `forced_decision` or `discard` at capacity |
+| `TRACELENS_DRAIN_DEPTH` / `_SIMILARITY` / `_MAX_CHILDREN` / `_MAX_TEMPLATES` | see `internal/config` | Drain tree shape and template caps |
 
 ### Metrics worth watching
 
 - `otlp_spans_dropped_total{reason}` — `rejected`, `queue_full`, `decode_error`, `cardinality_budget`, `produce_failed`
 - `ingest_queue_depth{signal}` vs `ingest_queue_capacity{signal}`
 - `clickhouse_rows_inserted_total{table}`, `clickhouse_insert_retries_total{table}`
+- `tracelens_inflight_traces`, `tracelens_inflight_bytes`, `tracelens_forced_decisions_total`, `tracelens_evicted_traces_total`
+- `tracelens_decisions_total{outcome,policy}`, `tracelens_late_spans_total{outcome}`
+- `tracelens_cardinality_breaches_total{key}`, `tracelens_cardinality_estimate{key}`
+- `tracelens_templates_created_total`, `tracelens_templates_evicted_total`, `tracelens_templates_total`
 
 ---
 
@@ -217,17 +355,28 @@ These are deliberate and recorded in [docs/DECISIONS.md](docs/DECISIONS.md):
   query engine will need a cast.
 - **OTLP/JSON is not implemented** (protobuf only — JSON is optional in the
   spec). A JSON request gets `415` rather than a silent misparse.
-- **`sampling_weight` is always 1**, since nothing samples yet. The column
-  exists now so no aggregate needs rewriting when it stops being 1.
 - **The `spans` ORDER BY costs ~4.2× read amplification on a service+time
   query with no `span_name` filter** (measured via `EXPLAIN ESTIMATE`).
   Swapping `span_name` and `timestamp` in the key would move the identical
   cost onto service-map queries instead — left as-is pending a real query-mix
   measurement to decide which pattern is higher QPS.
+- **Consistent-hash routing is implemented but not wired in** — `internal/sampling/router.go`
+  is ready for a multi-assembler topology, but today the Kafka consumer
+  group is the only thing partitioning trace ownership across instances.
+- **`template_id` allocation is process-scoped**, not shared across
+  assembler instances or restarts — a restart or a second instance can
+  assign different IDs to the same template shape. Acceptable for now since
+  `log_templates` is a `ReplacingMergeTree` keyed by `template_id` within
+  one process's lifetime; a shared allocator is future work if templating
+  needs to survive restarts with stable IDs.
+- **Critical-path computation is a simplification** (follows the child with
+  the latest end-time at each level), not full gap-accounting critical-path
+  analysis.
 
 ## Roadmap
 
 1. ~~OTLP ingestion, ClickHouse schema, demo workload~~ — done
-2. Trace assembly + tail sampling (bounded buffer, eviction policy, sampling weights)
-3. Query engine: DSL → AST → logical plan → physical plan
-4. UI: trace waterfall, flamegraph, service map, log explorer
+2. ~~Trace assembly + tail sampling (bounded buffer, eviction policy, sampling weights)~~ — done
+3. ~~Log pipeline (Drain templating, cardinality control, per-severity retention)~~ — done
+4. Query engine: DSL → AST → logical plan → physical plan
+5. UI: trace waterfall, flamegraph, service map, log explorer

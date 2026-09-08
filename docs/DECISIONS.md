@@ -390,3 +390,466 @@ healthcheck can fail for reasons entirely unrelated to health.
 - **Decompression is double-capped** — `MaxBytesReader` on the compressed
   stream and `io.LimitReader` on the decompressed one. Only the second stops a
   decompression bomb.
+
+---
+
+## 2026-09-08 — Phase 2: trace assembly, tail sampling, cardinality control, Drain
+
+Four decisions were gated behind explicit approval before any code was written.
+
+### 1. Completion heuristic: fixed wait + root-closure early exit
+
+**Decided.** A trace decides at `T+DecisionWait` (default 5s) from its first
+span, unless the root span (parent_span_id all-zero) is present and every
+buffered span's interval already fits inside `[root.start, root.end]`, in
+which case it decides immediately.
+
+**Rejected: plain fixed wait.** Simpler (one timestamp per trace), but holds
+every trace — including one that finished in 50ms — for the full window.
+**Rejected: quiet period after last span.** Adapts to real trace shape, but
+has no upper bound: a heartbeat-emitting or retrying service can keep a
+trace "alive" indefinitely, fighting the hard memory cap directly.
+**Rejected as primary: root-seen + grace window.** The root is not
+guaranteed to ever arrive (dropped in transit, or a genuinely async
+fire-and-forget child that outlives it), so it needs the identical fallback
+timer as the other options for that case — it only ever *shortens* the
+common path, never replaces the backstop.
+
+The early-exit condition costs nothing extra to check (it runs once per
+span, on the already-buffered spans) and captures most of quiet-period's
+benefit — most real traces are trees fully contained in their root's own
+span — without quiet-period's unbounded-liveness risk.
+
+### 2. Buffer eviction: forced early decision, not discard
+
+**Decided.** When the in-flight buffer's hard cap (trace count or bytes) is
+hit, the oldest trace is decided *right now* using whatever spans arrived so
+far, through the identical decide-and-emit path a natural completion uses.
+Nothing that entered the buffer is ever discarded outright.
+
+**Rejected: oldest-first discard.** Simpler, but a genuine, permanent loss of
+data that already arrived — the trace-buffer equivalent of phase 1's
+rejected drop-oldest queue policy, for the same reason.
+
+Both policies are implemented and selectable
+(`TRACELENS_BUFFER_EVICTION`); both metrics
+(`tracelens_forced_decisions_total`, `tracelens_evicted_traces_total`) exist
+under either configuration, only one increments, matching phase 1's
+"export every reason, touch every series at zero" pattern.
+
+### 3. Policy engine: ordered chain, first-non-abstain-wins
+
+**Decided.** `always_sample_errors`, `always_sample_slow` (threshold or
+rolling p99), `rate_limiting`, `attribute_match`, `probabilistic`, composed
+into `PolicyChain.Decide`: walk the configured list, the first policy that
+returns a real verdict (not abstain) wins. An entirely-abstaining chain is
+treated as `Drop`, not a silent 100% keep — a real deployment must end its
+list with an explicit catch-all.
+
+**Weight is 1/p, computed once per decision, never ad hoc.** `p=1` for every
+deterministic keep (errors, slow-threshold, a matching attribute) — a trace
+you always keep isn't a sample of a larger population, it *is* the
+population, and upweighting it would overstate reality.  `probabilistic`
+reports its configured rate. `rate_limiting` no longer reports a weight at
+all — see decision 3a below for why that changed mid-implementation.
+
+**Verified statistically** (`TestUpweightingRecoversTruePopulation`): at a
+1% probabilistic rate over 100,000 synthetic traces, the raw sampled count
+was 99.0% off the true population; the same traces upweighted by 1/p were
+4.7% off. A second test mixing a deterministic population (errors, p=1) with
+a 5%-probabilistic one recovered the true mixed total within 0.6%.
+**Verified for the explicit "1% errors, retained at 100%" requirement**
+(`TestErrorsAlwaysRetainedAtOverallLowRate`): 200/200 synthetic error traces
+retained, non-error traces sampled at 5.0% against a configured 5% target.
+
+### 3a. A real semantic bug found via the perf audit's benchmark: `rate_limiting` and `probabilistic` were mutually exclusive
+
+**The bug.** `rate_limiting`'s original design *always* resolved (Sample or
+Drop, reporting an empirical admit-ratio as its weight either way) — the
+same "always resolves" property `probabilistic` has. In `PolicyChain.Decide`
+(first-non-abstain-wins), two policies that both always resolve are mutually
+exclusive by construction: whichever comes first in the configured list
+makes the *other* completely unreachable, for **any** ordering. This was not
+a benchmark artifact — it affected the real deployed `policies.yaml`, where
+`attribute_match` and `probabilistic` sat after `rate_limiting` and were
+therefore silently dead code the entire time this phase's chain was live.
+It surfaced when a perf-audit subagent flagged that
+`BenchmarkPolicyChainDecide` never touched `probabilistic` at all, and
+tracing *why* led straight to the design flaw, not just the benchmark.
+
+**The fix.** `rate_limiting` now **abstains** while token capacity is
+available (consuming a token but deferring the actual keep/drop decision —
+and its weight — to whichever policy runs next), and only actively
+**vetoes** (Drop, certainty, `Probability=1`) once genuinely exhausted. This
+makes it compose correctly as a capacity guard ahead of a baseline policy,
+which is the role a rate limiter is actually meant to play, rather than a
+second, competing decision-maker. Verified directly
+(`TestRateLimiterComposesWithProbabilistic`): with capacity available,
+`probabilistic` now decides and is named as the resolving policy; once
+exhausted, `rate_limiting` vetoes before `probabilistic` ever runs.
+
+**Accepted imprecision:** a trace that passes through while capacity is
+available is weighted purely by whatever policy resolves it downstream, not
+adjusted for the (normally small, under healthy load) probability that
+capacity could have been exhausted. Computing that joint probability
+correctly across an arbitrary chain is a harder problem this does not
+attempt to solve, and is out of scope here.
+
+**`deploy/tracelens/policies.yaml` was also reordered.** `attribute_match`
+now runs **before** `rate_limiting`, not after: the comment above it
+promises "always keep traces explicitly flagged for debugging, regardless of
+the baseline rate" — with the old order, an exhausted rate-limiter bucket
+could veto a debug-flagged trace before `attribute_match` ever got a chance,
+breaking that promise outright. `TestDeployedConfigFilesAreValid` guards
+this file's parseability; it does not (and cannot, without executing the
+whole chain semantically) guard against a reordering bug like this one — a
+lesson worth remembering.
+
+**Verified live**, post-fix: `tracelens_decisions_total` on the running
+demo stack showed `probabilistic` deciding both `sample` and `drop`
+outcomes for the first time — before the fix, only `always_sample_errors`
+and `rate_limiting` ever appeared, exactly as the mutual-exclusion bug
+predicts.
+
+### 4. Routing: `Router` (rendezvous hashing) as a tested primitive, Kafka partitioning stays the live mechanism
+
+**Decided.** `internal/sampling.Router` implements genuine consistent hashing
+(highest random weight / rendezvous), distinct from what Kafka partitioning
+actually is: `hash(key) % N` sharding, which phase 1 already documented as
+resize-*unstable* (changing partition count remaps nearly every key). Router
+gives the formal guarantee sharding does not: adding one replica to a set of
+N remaps only ~1/(N+1) of keys.
+
+**Measured, not asserted:** `TestRouterResizeStability` grows a 4-replica set
+to 5 and finds ~20.0% of keys remapped (theoretical 1/5 = 20%) against
+naive `hash(key)%N` remapping ~75%+ on the *identical* resize, in the same
+test, for a direct, honest comparison rather than two separate claims.
+
+**A genuine bug was caught building Router itself:** the first hash
+combination (`fnv1a(key || separator || replica)`, one FNV-1a stream) showed
+one replica in a 4-way set winning ~2x its fair share in
+`TestRouterSpread`. FNV-1a has weak avalanche on short, near-identical tails
+— exactly what single-character replica names ("a","b","c","d") are, since
+they differ by one bit in their last byte. Fixed by hashing key and replica
+**independently** and combining through a SplitMix64 finalizer, which fully
+avalanches the combination regardless of how correlated the inputs are;
+re-ran spread and resize-stability tests clean afterward.
+
+**Not wired into the live partition-assignment path.** Building a custom
+static/deterministic partition assignor to replace Kafka's own consumer-group
+rebalancing was considered and rejected: it would trade away Kafka's
+automatic failure-driven rebalancing (a crashed replica's partitions
+reassign automatically today) for a fragile, self-built alternative, for a
+benefit — decoupling replica count from partition count — this phase does
+not need. Router ships as a correct, tested, reusable primitive for the
+scenario where that decoupling *is* needed later.
+
+**What breaks with round-robin, specifically at the assembler layer**
+(the requirement's explicit ask, since phase 1 only documented the ingest
+side): each instance sees only a fragment of a trace and independently
+judges it complete, so one trace becomes N partial trace records; the
+instance that never received the `ERROR` span produces a false-negative on
+`always_sample_errors`, invisibly, since nothing records that the full
+trace ever existed; the in-flight buffer fills with fragments that never
+complete, starving the forced-decision eviction path with garbage instead
+of genuine backpressure signal; and every fragment computes its own
+`sampling_weight` against the wrong denominator, so any aggregate over
+sampled data silently double-counts.
+
+**Verified against a real broker with 3 concurrent consumer-group members**
+(`TestConsumerNoTraceSplitAcrossThreeInstances`, new this phase — phase 1's
+own test only proved the *producer* side routes correctly; this proves the
+*consumer* side holds once the partition set is actually spread across
+multiple live processes, which is the layer that matters since the
+in-flight buffer lives in one process's memory): 300 traces produced across
+12 partitions, 3 independent `Consumer` instances in one group, zero traces
+observed by more than one instance.
+
+### 5. Late spans: bounded decided-cache, attach-if-sampled / drop-if-not
+
+**Decided.** A separate, bounded cache (`Buffer.decided`, capped by count and
+TTL, same eviction discipline as the in-flight buffer) remembers every
+trace's outcome after it decides. A span arriving for a trace not in the
+in-flight buffer is checked against this cache: present and sampled →
+attach directly to storage carrying the trace's *original* weight (siblings
+must share one weight or per-trace aggregates break); present and dropped →
+drop, counted; absent from *both* structures (cache itself aged out, or
+genuinely new) → falls through to fresh assembly. This last case is an
+honest, bounded-memory trade-off: a span late enough to outlive the decided
+cache's retention window starts a brand-new, single-span "trace" with its
+own fresh decision, rather than growing the cache without bound to catch an
+arbitrarily late straggler.
+
+`tracelens_late_spans_total{outcome}` distinguishes `attached` from
+`dropped`. Exercised directly by `TestAssemblerLateSpanWeight` and
+`TestBufferLateSpans`; the late-span RATE under sustained load is what
+`TestErrorsAlwaysRetainedAtOverallLowRate`'s 20,000-trace run implicitly
+measures as zero (buffer capacity was never pressured in that test), and
+what the live demo stack's `tracelens_late_spans_total{outcome="attached"}`
+counter tracks in production — it moved (1987 observed during one verification
+run), consistent with real out-of-order network delivery rather than a
+synthetic worst case.
+
+### 6. Offset-commit safety under buffered, delayed decisions
+
+**The problem, precisely.** Phase 1 could commit a Kafka offset the instant
+its batch was durably written, because decode → write was immediate. Now a
+span can sit in the trace buffer for the full completion window before its
+trace resolves. Committing an offset as soon as a span is merely *buffered*
+— not once its trace *decides and is durably written* — would mean a crash
+mid-window loses everything still in memory, with no redelivery, since the
+offset already advanced. Exactly the silent loss principle 1 forbids.
+
+**Decided: `OffsetWatermark`**, one per-partition min-heap of (first-seen
+offset, trace_id) for currently-undecided traces. `pipeline.Consumer` gained
+an additive `RunWithCommitGate` (existing `Run`/`Handler` untouched, zero
+regression risk to phase 1's tests) that commits, per partition, up to
+`min(highest offset this cycle, the watermark's floor if lower)` — so a
+partition with an undecided trace holds its commit at exactly that trace's
+first offset, while every other partition proceeds normally. **`finishTrace`
+only resolves the watermark once the actual write is confirmed durable**,
+not once `emit`/`lateAttach` is merely called — `EmitFunc` and
+`LateAttachFunc` both return an error for exactly this reason. On a write
+failure, the decision is deliberately left **unrecorded** too (not just the
+watermark unresolved): since the trace has already left the buffer by then,
+a Kafka redelivery of the same spans finds nothing in-flight and nothing
+decided, and restarts fresh assembly from scratch — safe specifically
+because probabilistic sampling is deterministic by trace_id, so a
+redelivered trace gets the identical verdict, not a second, inconsistent
+one. Locked down directly by
+`TestAssemblerWithholdsWatermarkOnWriteFailure`.
+
+**Two real bugs found building this, both empirically, via a broker-backed
+test that intentionally used a live Redpanda rather than a mock:**
+
+- **A Go map zero-value sentinel bug.** The first `pending[tp]` tracking
+  used `if r.Offset > pending[tp]` to decide whether to record a new
+  high-water offset — but a *fresh* partition's legitimate first offset is
+  `0`, identical to the map's zero-value default for "not present". The
+  condition `0 > 0` is false, so the very first offset on any partition was
+  silently never recorded. Fixed by checking presence explicitly
+  (`if cur, ok := pending[tp]; !ok || r.Offset > cur`).
+- **`PollFetches` does not wake up periodically on its own.** The retry
+  design assumed an idle poll would return empty every so often, giving the
+  ceiling a chance to re-check a previously-withheld partition. In fact
+  `PollFetches` blocks until either new data arrives on *any* subscribed
+  partition or the caller's context is done — `kgo.FetchMaxWait` only
+  bounds one broker-side fetch request/response cycle, not the client's own
+  idle-wait behavior. Fixed by wrapping each poll in a
+  `context.WithTimeout(ctx, commitRetryInterval)` and treating that
+  timeout's `context.DeadlineExceeded` as "nothing new, but still recheck
+  the ceiling" rather than a fetch error. Both bugs were caught by
+  `TestConsumerCommitGateWithholdsAndReleases` genuinely hanging/failing
+  against a real broker, not by code review — exactly the kind of subtle,
+  timing-dependent bug a mock would not have exposed.
+
+### 7. Drain: fixed-depth tree, eager numeric wildcarding, LRU template cap
+
+**Decided**, implemented from scratch, no library. Tree: root → level 1 keyed
+by token count → levels 2..depth-1 keyed by leading token (a numeric-looking
+token routed to a shared wildcard child immediately, per the approved
+choice, rather than branching the tree on what's almost certainly an id) →
+leaf holding a small list of candidate clusters, matched by
+position-wise similarity (`wildcard` counts as an automatic match), merged
+(any disagreeing position generalizes to `<*>`, so templates only ever
+widen, never narrow) or created fresh with the next dense id.
+
+**Verified against a known-shape corpus**
+(`TestDrainRecoversKnownTemplateCount`): a corpus built from exactly 5
+known shapes, instantiated with varying parameters, recovers to exactly 5
+templates regardless of corpus volume (50 vs 5000 instances of one shape:
+template count unchanged). **Verified live**, not just synthetically: 12,000
+real OTLP log records sent to the running demo stack across 4 services
+extracted exactly the 5 template shapes the generator actually used,
+correctly generalizing e.g. `"payment declined for account 4919 code 0"`
+into `payment declined for account <*> code <*>`.
+
+**`template_id` is dense and process-scoped, matching the T64 codec
+constraint phase 1 already recorded**, not globally coordinated across
+replicas or restarts — a documented, accepted gap (see §10), not an
+oversight, given the actually-deployed topology is one assembler replica.
+
+**A cheap, real correctness gap found and fixed before it shipped:**
+persisting a template to the `log_templates` dictionary only on *creation*
+(`IsNew`) would leave the dictionary holding stale, more-literal text
+forever once a later log widens that template further. Fixed by tracking
+whether `merge()` actually changed a template (a `Changed` bool alongside
+`IsNew` on `Match`) and upserting on either — `log_templates` is a
+`ReplacingMergeTree` keyed on `template_id` specifically so a repeat upsert
+with fresher text is the correct, cheap resolution. Caught by a test
+(`TestTemplateStoreReportsUpsertOnCreateAndOnWiden`) written against the
+*intended* behavior, before any live traffic exposed it.
+
+**Body retention: kept, not dropped, by explicit choice.** `template_id`
+and `params` are populated unconditionally on every log record, satisfying
+"store template_id+params, not the rendered string" as written — but the
+raw `body` column is *also* kept, rather than cleared, because phase 1
+already built a `tokenbf_v1` free-text-search index specifically against
+it, and dropping body would silently regress the log explorer's search to
+satisfy a phrase in this prompt that didn't ask for that trade explicitly.
+The storage saving templating *would* achieve is measured and recorded
+below regardless, so the decision to actually drop body later can be made
+from real numbers.
+
+**Measured storage saving**
+(`TestTemplateStoreMeasuresStorageSaving`, 10,000 repetitive synthetic log
+lines): raw body bytes would cost 783,425 bytes; `template_id`+`params` for
+the identical lines costs 283,408 bytes — a **2.76× saving**, before
+ClickHouse's own column compression is even applied on top.
+
+### 7a. Cache-only performance bug found via benchmarking: `HyperLogLog.Estimate()` rescanned all 16,384 registers on every attribute occurrence
+
+**Measured, before any fix:** `BenchmarkCardinalityGuardEnforce` =
+16,811 ns/op; `BenchmarkHyperLogLogEstimate` (a bare register scan) =
+16,880 ns/op — nearly identical, proving `Enforce`'s cost was **entirely**
+the register scan, called on every single attribute key/value pair rather
+than only when checking for a breach. `BenchmarkCardinalityGuardApplyToAttributes`
+(a realistic 5-attribute span) measured 83,100 ns/op as a direct
+consequence.
+
+**Fixed by caching**, not by approximating: `Estimate()` is a pure function
+of register content, so if `Add()` reports that an observation did **not**
+change any register (already-seen value), the cached estimate from the
+last time a register *did* change is bit-for-bit identical to what a fresh
+scan would produce — this is exact, not a looser approximation.
+`HyperLogLog.Add`/`Merge` now report whether they changed anything;
+`CardinalityTracker` only recomputes on a true change.
+
+**Measured after:** `BenchmarkCardinalityGuardEnforce` = 20.32 ns/op (a
+**~827× improvement**); `BenchmarkCardinalityGuardApplyToAttributes` =
+271.1 ns/op (a **~306× improvement**). `BenchmarkHyperLogLogEstimate`
+itself is unchanged (~16µs) — the raw primitive's cost didn't change, the
+caller now simply avoids paying it needlessly.
+
+### 8. Cardinality control: HyperLogLog, `bucket` as the default action
+
+**Decided.** One `HyperLogLog` per attribute key (constant ~16KB regardless
+of true cardinality — an exact set's memory grows linearly with true
+cardinality, exactly what this exists to prevent). On budget breach:
+`drop` (remove the key entirely), `bucket` (replace the value with
+`hash(value) % N`, retaining a bounded amount of correlation signal — the
+same generalize-rather-than-discard idea Drain uses for its own templates),
+or `keep_and_alert` (leave the value untouched, only count the breach).
+All three ship as configurable per-key overrides regardless of the default;
+`bucket` was chosen as the default because CLAUDE.md's principle 4 names
+only "dropped or bucketed" as valid enforcement outcomes, reading
+`keep_and_alert` as a legitimate opt-in transitional/diagnostic mode rather
+than a permanent default, and because it degrades more gracefully than an
+outright drop for a key whose value still carries *some* correlation value.
+
+**Verified live**, not just in unit tests: sending 12,000 real log records
+with 5,000 distinct synthetic emails against a configured `customer.email`
+budget of 1,000 triggered 1,879 recorded breaches
+(`tracelens_cardinality_breaches_total{key="customer.email"}`) on the
+running demo stack — the mechanism engages under real traffic exactly as
+designed, not only against synthetic unit-test input.
+
+### 8a. Two more unbounded-map bugs found via the same perf audit: `rateLimiter.buckets` and `CardinalityTracker.sketches`
+
+Every other stateful map in this codebase (`Buffer.inflight`/`decided`,
+Drain's `clusters`) already has an explicit cap, LRU eviction, and a
+counter. Two did not:
+
+- **`rateLimiter.buckets`**, keyed by `service_name`, grew once per distinct
+  service ever seen, forever, under one non-sharded lock, with zero
+  visibility. If `service.name` ever carried a per-tenant/per-pod identifier
+  — precisely the anti-pattern `CardinalityGuard` exists elsewhere to
+  police — this was an unbounded, silent memory leak.
+- **`CardinalityTracker.sketches`**, keyed by attribute *key* (not value —
+  values were already correctly bounded via the HLL itself), had the
+  identical shape of gap: lower risk in practice, since attribute keys are
+  normally a small, schema-like set, but a producer varying key *names*
+  dynamically would grow this map by 16KB per new key forever.
+
+**Fixed identically**: both capped (`maxTrackedServices`,
+`maxTrackedKeys`, 10,000 each) with LRU eviction (a generation counter
+stamped on every touch, same mechanism Drain's own `evictLRU` already
+used) and a counter/gauge each
+(`tracelens_rate_limiter_services_{tracked,evicted_total}`,
+`tracelens_cardinality_keys_evicted_total`).
+
+### 8b. A third perf bug: `Assembler.Ingest` allocated a fresh closure on every span
+
+`a.buffer.Ingest(s, a.forceDecideFn())` called `forceDecideFn()` — a
+function returning a new closure — on **every** ingested span, regardless
+of whether capacity eviction ever fires. The closure itself is stateless
+(closes only over `a`), so one instance serves the assembler's entire
+lifetime. Fixed by binding it once in `NewAssembler`
+(`a.forceDecide = a.doForceDecide`) and reading the field in `Ingest`
+instead. Verified via allocation profiling
+(`go tool pprof -alloc_objects`) that `Assembler.Ingest` itself now
+allocates essentially nothing (3,738 objects across a 1,000,000-iteration
+benchmark run) — the aggregate "3 allocs/op" `go test -benchmem` still
+reports for `BenchmarkAssemblerIngest` is unchanged only because it
+coincidentally lines up with a *different*, legitimate, unavoidable
+allocation (`OffsetWatermark.Track`'s per-new-trace tracking struct); the
+headline number staying flat while profiling proved the fix is a case
+worth recording, since the benchmark alone would have looked like "no
+improvement" despite genuinely removing a wasteful, per-item allocation.
+
+### 8c. A fourth perf bug: Drain had no per-leaf cluster cap
+
+`MaxTemplates` bounds the whole tree, but not clusters *at one leaf* — and
+`findOrCreate`'s similarity scan is O(clusters at that leaf). Global LRU
+eviction protects a frequently-touched ("hot") leaf at the expense of
+others, letting one leaf's list grow toward the entire tree-wide budget.
+**Measured**: a leaf holding 2,000 same-shaped-but-distinct clusters cost
+**138×** a leaf holding one (57,532 ns/op vs 416.5 ns/op per `Parse` call).
+Fixed with a separate `MaxClustersPerLeaf` cap (default 200, LRU-evicted
+independently of the tree-wide cap) — **measured after: 9,188 ns/op, a
+6.5× improvement** on the identical stress case. Backward compatible by
+construction: `MaxClustersPerLeaf: 0` (the zero value, what every existing
+test already used) disables the per-leaf cap entirely, verified by
+`TestDrainPerLeafClusterCap`'s explicit "disabled" case.
+
+### 9. Log-to-trace correlation and per-severity retention
+
+Correlation (`trace_id`/`span_id` on `LogRow`, the `idx_trace_id` bloom
+filter) already existed structurally from phase 1 — Drain only tokenizes
+`body`, leaving these untouched. **New this phase**: per-severity TTL on
+`tracelens.logs` (migration 0006), layered under the *same* unconditional
+recompress/cold-tier clauses from phase 1: TRACE/DEBUG (severity < 9)
+delete after 1 day, INFO/WARN (9–16) after 14 days (unchanged from phase
+1's flat default), ERROR/FATAL (≥ 17) after 90 days. A low-severity row's
+1-day delete fires before it would ever reach the 7-day cold-tier move,
+which is fine — there is no reason to tier a row into cold storage moments
+before deleting it.
+
+### 10. Accepted gaps, phase 2
+
+- **`template_id` is process-scoped**, not coordinated across assembler
+  replicas or process restarts. Documented in `internal/logs/doc.go` and
+  above (§7) rather than building a distributed sequence allocator the
+  actual deployed topology (one replica) does not need yet.
+- **`Router` is not wired into the live partition-assignment path** (§4) —
+  a deliberate scope decision, not an oversight, given the risk of trading
+  away Kafka's automatic rebalance-on-failure for a self-built static
+  assignor this phase does not need.
+- **Rate-limiting's weight for admitted-under-capacity traces does not
+  account for the (usually small) probability that capacity could have
+  been exhausted** (§3a) — a real, accepted statistical imprecision, not a
+  bug, distinct from the mutual-exclusion bug that *was* fixed.
+- **A verification tool's own bug, recorded because the debugging process
+  is worth remembering, not because it is a TraceLens defect:** the
+  one-off script used to push manual OTLP log traffic for end-to-end
+  verification reused the *same* `[]*logspb.LogRecord` slice across four
+  different `ResourceLogs` parents when hand-constructing a protobuf
+  message tree. This violates protobuf-go's assumption that a message
+  tree is a tree, not a DAG, and produced a wire-level artifact where only
+  one resource's data actually marshaled — `SplitLogs`, `EnqueueBatch`,
+  and the batcher were all independently re-verified correct in isolation
+  (a small reproduction test, then a full receiver-to-batcher pipeline
+  test with a mock sink) before concluding the bug was in the throwaway
+  script, not the shipped ingest path. The lesson: when hand-building a
+  protobuf message tree for a test/verification tool, never let two parent
+  messages share the same child message pointer.
+
+Post-phase live verification, all on the running demo stack rebuilt with
+every fix above: 1.2M+ spans processed with weighted `sampling_weight`
+values observed spanning the full 1.0–3.0+ range (proving the tail
+sampler's rate-limiting admit-ratio weighting is live, not just
+unit-tested); 12,000 real log records templated into exactly 5 clusters;
+1,879 cardinality breaches recorded on a deliberately-overloaded attribute
+key; `probabilistic` confirmed reachable and deciding after the mutual-
+exclusion fix, where before the fix it never appeared in
+`tracelens_decisions_total` at all.
