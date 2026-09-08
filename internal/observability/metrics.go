@@ -64,6 +64,35 @@ type Metrics struct {
 	InsertRetries    *prometheus.CounterVec
 	InsertLatency    *prometheus.HistogramVec
 	InsertQueueDepth *prometheus.GaugeVec
+
+	// ---- trace assembler / tail sampler ------------------------------------
+	InflightTraces       prometheus.Gauge
+	InflightBytes        prometheus.Gauge
+	ForcedDecisionsTotal prometheus.Counter
+	EvictedTracesTotal   prometheus.Counter
+	LateSpansTotal       *prometheus.CounterVec // outcome: attached, dropped
+	LateSpansAttached    prometheus.Counter
+	LateSpansDropped     prometheus.Counter
+	DecisionsTotal       *prometheus.CounterVec // outcome: sampled, dropped ; policy: which policy decided
+	DecisionLatency      prometheus.Histogram
+	SamplingWeight       prometheus.Histogram
+	RoutingMismatchTotal prometheus.Counter
+
+	// ---- cardinality control ------------------------------------------------
+	CardinalityBreaches         *prometheus.CounterVec // key
+	CardinalityEstimate         *prometheus.GaugeVec   // key -- current HLL estimate, for the dashboard
+	CardinalityKeysEvictedTotal prometheus.Counter     // distinct attribute KEYS evicted, past MaxTrackedKeys
+
+	// ---- rate_limiting policy -----------------------------------------------
+	RateLimiterServicesTracked      prometheus.Gauge
+	RateLimiterServicesEvictedTotal prometheus.Counter
+
+	// ---- log templating (Drain) ---------------------------------------------
+	TemplatesTotal        prometheus.Gauge // distinct clusters currently held
+	TemplatesCreatedTotal prometheus.Counter
+	TemplatesEvictedTotal prometheus.Counter
+	LogBytesRaw           prometheus.Counter // bytes body WOULD have cost
+	LogBytesTemplated     prometheus.Counter // bytes template_id+params actually cost
 }
 
 // NewMetrics builds and registers the metric set on a fresh registry.
@@ -175,6 +204,88 @@ func NewMetrics() *Metrics {
 		Help: "Rows buffered in the async writer, by table.",
 	}, []string{"table"})
 
+	m.InflightTraces = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tracelens_inflight_traces",
+		Help: "Traces currently buffered in the assembler, awaiting a sampling decision.",
+	})
+	m.InflightBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tracelens_inflight_bytes",
+		Help: "Approximate bytes held by the in-flight trace buffer.",
+	})
+	m.ForcedDecisionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_forced_decisions_total",
+		Help: "Traces decided early because the buffer hit its capacity cap, using whatever spans had arrived.",
+	})
+	m.EvictedTracesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_evicted_traces_total",
+		Help: "Traces discarded outright when the buffer hit its capacity cap (only fires under the discard eviction policy).",
+	})
+	m.LateSpansTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tracelens_late_spans_total",
+		Help: "Spans that arrived after their trace's sampling decision had already fired, by outcome.",
+	}, []string{"outcome"})
+	m.DecisionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tracelens_decisions_total",
+		Help: "Trace sampling decisions, by outcome and by which policy in the chain decided.",
+	}, []string{"outcome", "policy"})
+	m.DecisionLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "tracelens_decision_latency_seconds",
+		Help:    "Wall time from a trace's first span to its sampling decision.",
+		Buckets: prometheus.ExponentialBuckets(0.01, 2, 16),
+	})
+	m.SamplingWeight = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "tracelens_sampling_weight",
+		Help:    "1/p assigned to sampled traces. 1.0 means deterministically kept (errors, slow, attribute match).",
+		Buckets: []float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000},
+	})
+	m.RoutingMismatchTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_routing_mismatch_total",
+		Help: "Trace ids observed by an assembler that a consistent-hash Router would assign elsewhere. Diagnostic only.",
+	})
+
+	m.CardinalityBreaches = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tracelens_cardinality_breaches_total",
+		Help: "Attribute values affected by a cardinality budget breach, by key.",
+	}, []string{"key"})
+	m.CardinalityEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tracelens_cardinality_estimate",
+		Help: "Current HyperLogLog distinct-value estimate, by attribute key.",
+	}, []string{"key"})
+	m.CardinalityKeysEvictedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_cardinality_keys_evicted_total",
+		Help: "Distinct attribute KEYS evicted (LRU) because the tracked-key cap was reached.",
+	})
+
+	m.RateLimiterServicesTracked = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tracelens_rate_limiter_services_tracked",
+		Help: "Distinct services currently holding a rate-limiter token bucket.",
+	})
+	m.RateLimiterServicesEvictedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_rate_limiter_services_evicted_total",
+		Help: "Service token buckets evicted (LRU) because the tracked-service cap was reached.",
+	})
+
+	m.TemplatesTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tracelens_log_templates_total",
+		Help: "Distinct Drain template clusters currently held.",
+	})
+	m.TemplatesCreatedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_log_templates_created_total",
+		Help: "New Drain clusters created (a log line matched no existing template closely enough).",
+	})
+	m.TemplatesEvictedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_log_templates_evicted_total",
+		Help: "Drain clusters evicted (LRU) because the template cap was reached.",
+	})
+	m.LogBytesRaw = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_log_bytes_raw_total",
+		Help: "Bytes the raw log body would have cost, had it been stored verbatim.",
+	})
+	m.LogBytesTemplated = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_log_bytes_templated_total",
+		Help: "Bytes template_id + params actually cost for the same log lines.",
+	})
+
 	reg.MustRegister(
 		m.SpansReceived, m.LogsReceived, m.PointsReceived,
 		m.spansDropped, m.logsDropped, m.pointsDropped,
@@ -184,7 +295,17 @@ func NewMetrics() *Metrics {
 		m.ConsumeRecords, m.ConsumeErrors,
 		m.RowsInserted, m.InsertBatches, m.InsertErrors, m.InsertRetries,
 		m.InsertLatency, m.InsertQueueDepth,
+		m.InflightTraces, m.InflightBytes, m.ForcedDecisionsTotal, m.EvictedTracesTotal,
+		m.LateSpansTotal, m.DecisionsTotal, m.DecisionLatency, m.SamplingWeight,
+		m.RoutingMismatchTotal,
+		m.CardinalityBreaches, m.CardinalityEstimate, m.CardinalityKeysEvictedTotal,
+		m.RateLimiterServicesTracked, m.RateLimiterServicesEvictedTotal,
+		m.TemplatesTotal, m.TemplatesCreatedTotal, m.TemplatesEvictedTotal,
+		m.LogBytesRaw, m.LogBytesTemplated,
 	)
+
+	m.LateSpansAttached = m.LateSpansTotal.WithLabelValues("attached")
+	m.LateSpansDropped = m.LateSpansTotal.WithLabelValues("dropped")
 
 	// Pre-resolve the hot-path children so per-span code does no label lookup.
 	m.SpansDroppedRejected = m.spansDropped.WithLabelValues(ReasonRejected)
