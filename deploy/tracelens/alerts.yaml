@@ -1,0 +1,41 @@
+# Alerting rules, evaluated every TRACELENS_ALERT_EVAL_INTERVAL (default
+# 60s) against the freshest 1-minute RED rollup bucket -- see
+# internal/alerting and cmd/query's alertFetcher. A rule notifies only on a
+# state TRANSITION (dedup) and never more often than its cooldown, even if
+# the underlying condition keeps flapping across that boundary.
+#
+# If this file fails to load, the query API still starts and serves
+# query/explain/trace/service-graph traffic -- alerting is a degraded mode,
+# not a hard startup dependency the way the assembler's sampling policy is.
+
+rules:
+  # Anomaly-based: fires when p95 latency is unusual relative to THIS
+  # service/operation's own seasonal (hour-of-day, day-of-week) baseline,
+  # not a fixed number -- catches a slowdown even on a service whose normal
+  # latency varies a lot by time of day.
+  - name: checkout-charge-latency-anomaly
+    service: checkout
+    operation: charge
+    metric: p95_latency_ms
+    type: anomaly
+    cooldown: 10m
+    webhook: http://localhost:9999/webhook
+
+  # Threshold-based: a fixed SLO number, independent of any baseline --
+  # appropriate when "acceptable" is a contractual constant, not "whatever
+  # is typical".
+  - name: checkout-error-rate-high
+    service: checkout
+    metric: error_rate
+    type: threshold
+    op: ">"
+    threshold: 0.05
+    cooldown: 5m
+    webhook: http://localhost:9999/webhook
+
+  - name: inventory-latency-anomaly
+    service: inventory
+    metric: p95_latency_ms
+    type: anomaly
+    cooldown: 10m
+    webhook: http://localhost:9999/webhook
