@@ -11,3 +11,5 @@ node_modules/
 *.test
 coverage.out
 *.parquet
+*.tsbuildinfo
+/bench/out/

@@ -107,3 +107,19 @@ querybench: ## Measure each optimiser pass's effect (bytes read, latency) at rea
 	TRACELENS_CLICKHOUSE_ADDR=localhost:9000 \
 	TRACELENS_CLICKHOUSE_PASSWORD=tracelens \
 	$(GO) run ./cmd/querybench -rows $(or $(ROWS),10000000) -iters $(or $(ITERS),5)
+
+.PHONY: storagebench
+storagebench: ## Compression, codec comparison, batch-size insert throughput
+	TRACELENS_CLICKHOUSE_ADDR=localhost:9000 \
+	TRACELENS_CLICKHOUSE_PASSWORD=tracelens \
+	$(GO) run ./cmd/storagebench
+
+.PHONY: correctnesscheck
+correctnesscheck: ## Prove ingested-minus-dropped equals stored under load
+	TRACELENS_CLICKHOUSE_ADDR=localhost:9000 \
+	TRACELENS_CLICKHOUSE_PASSWORD=tracelens \
+	$(GO) run ./cmd/correctnesscheck -traces $(or $(TRACES),500) -spans-per-trace $(or $(SPANS),3)
+
+.PHONY: bench-all
+bench-all: ## Run every Part B benchmark; raw output lands in bench/out/
+	ROWS=$(or $(ROWS),10000000) ITERS=$(or $(ITERS),5) ./scripts/bench-all.sh
