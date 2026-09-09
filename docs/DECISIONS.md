@@ -1929,7 +1929,52 @@ several sinks, the first is not the one you want to keep. Now `errors.Join`.
 Found by enabling `errorlint`, which was already configured but whose findings
 had never been acted on because the lint job was red.
 
-### 11. Not done, and why
+### 11. Fixed: two deployment bugs that only a real run could surface
+
+Both were caught by actually running the thing, and neither was visible in
+review.
+
+**The Dockerfile's second stage silently changed what Compose builds.** With
+no `--target`, BuildKit builds the LAST stage in the file. Appending `slim`
+after `runtime` therefore made `docker compose build` produce the distroless
+image, whose healthchecks (`wget`, run INSIDE the container) cannot exist.
+Every service came up unhealthy, and the symptom was `dependency failed to
+start` -- not a build error, and nothing pointing at the Dockerfile. Both
+call sites now name their target explicitly rather than relying on stage
+order, and the comment claiming `runtime` was "the default" is corrected,
+because that comment is what made the mistake easy.
+
+**The published image tag was not the git tag.** `docker/metadata-action`'s
+`type=semver,pattern={{version}}` strips the leading `v`, so the tag `v1.0.0`
+publishes images tagged `1.0.0`. The deploy job passed the git tag straight
+through as the image reference, and the `fly.toml` files pinned `:v1.0.0` --
+both asking the registry for something that does not exist. It never failed
+loudly because the Fly step correctly skipped for want of a token; a
+configured account would have hit it on the first real deploy. The version is
+now derived once in `preflight` and the configs pin the tag that actually
+exists.
+
+The general point, since it repeats: neither bug is findable by reading. The
+first needed `docker compose up`, the second needed a tag push. "It compiles
+and the tests pass" says nothing about deployment.
+
+### 12. Verified: CI was red for five phases
+
+The lint job had been failing since Phase 1 and the race-test job since
+Phase 2, so nobody was reading either. That is how the amd64 sampling bug in
+§8 survived -- CI was the only thing that could have caught it, and it had
+stopped being a signal.
+
+All five jobs now pass: build/vet, golangci-lint, race tests with real
+containers, hot-path benchmarks, and the full `docker compose up` smoke test
+asserting spans reach ClickHouse end to end. The README's CI badge is
+therefore a real claim rather than decoration.
+
+**The lesson worth keeping:** a red CI badge is not a nuisance to route
+around, it is an unread bug report. Three genuine defects (§8, §10, §11) were
+sitting in it.
+
+### 13. Not done, and why
 
 - **The live demo is not deployed.** Every artefact is written and validated
   — five `fly.toml` files, a Helm chart (`helm lint` clean, kubeconform
@@ -1938,6 +1983,15 @@ had never been acted on because the lint job was red.
   Vercel login. Those are credentials to be entered by their owner, not
   guessed at. `docs/DEPLOYMENT.md` is the step-by-step.
 - **`cmd/coldexport` has never run against real S3**, only MinIO (see §5).
-- **The GitHub Actions deploy workflow has never executed.** It is written
-  against documented action APIs and reviewed, but a workflow's first real
-  run is its first real test.
+  MinIO is S3-compatible, which is not the same as being S3.
+- **The Fly deploy job has never executed.** The image-publishing half of the
+  workflow ran for real on the `v1.0.0` tag and succeeded — four multi-arch
+  images built and pushed to GHCR — but the Fly job skipped for want of a
+  token, exactly as designed. The `flyctl deploy` steps and the post-deploy
+  smoke test remain unexercised.
+- **GHCR packages are private by default.** The `v1.0.0` images exist but
+  cannot be pulled anonymously until their visibility is changed in the
+  package settings, which needs `write:packages` — a scope the local `gh`
+  token does not carry.
+- **The repository's Website field is empty**, since there is no live demo URL
+  to put in it yet. `gh repo edit --homepage <url>` sets it after deploying.

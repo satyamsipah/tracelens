@@ -4,7 +4,7 @@ app = "tracelens-collector"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/satyamsipah/tracelens-collector:v1.0.0"
+  image = "ghcr.io/satyamsipah/tracelens-collector:1.0.0"
 
 [env]
   TRACELENS_KAFKA_BROKERS = "tracelens-redpanda.internal:9092"

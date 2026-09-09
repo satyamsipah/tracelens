@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
+      version: ${{ steps.vars.outputs.version }}
       deploy_fly: ${{ steps.vars.outputs.deploy_fly }}
     steps:
       - id: vars
@@ -38,6 +39,12 @@ jobs:
         run: |
           tag="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # docker/metadata-action's semver pattern strips the leading "v",
+          # so the git tag v1.0.0 publishes images tagged 1.0.0. Deploying
+          # "$tag" verbatim would ask the registry for an image that does not
+          # exist; derive the image version once, here, rather than letting
+          # every consumer guess.
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           if [ -n "$FLY_API_TOKEN" ]; then
             echo "deploy_fly=true" >> "$GITHUB_OUTPUT"
           else
@@ -123,7 +130,7 @@ jobs:
       cancel-in-progress: false
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
       OWNER: ${{ github.repository_owner }}
     steps:
       - uses: actions/checkout@v4
@@ -136,24 +143,24 @@ jobs:
       - name: collector
         run: |
           flyctl deploy --config deploy/fly/collector.fly.toml \
-            --image "ghcr.io/$OWNER/tracelens-collector:$TAG" --yes
+            --image "ghcr.io/$OWNER/tracelens-collector:$VERSION" --yes
 
       # Before query: the assembler owns the ClickHouse migrations, so a
       # schema change must land before anything reads against it.
       - name: assembler
         run: |
           flyctl deploy --config deploy/fly/assembler.fly.toml \
-            --image "ghcr.io/$OWNER/tracelens-assembler:$TAG" --yes
+            --image "ghcr.io/$OWNER/tracelens-assembler:$VERSION" --yes
 
       - name: query
         run: |
           flyctl deploy --config deploy/fly/query.fly.toml \
-            --image "ghcr.io/$OWNER/tracelens-query:$TAG" --yes
+            --image "ghcr.io/$OWNER/tracelens-query:$VERSION" --yes
 
       - name: demo traffic
         run: |
           flyctl deploy --config deploy/fly/demo.fly.toml \
-            --image "ghcr.io/$OWNER/tracelens-demo:$TAG" --yes
+            --image "ghcr.io/$OWNER/tracelens-demo:$VERSION" --yes
 
       # A deploy that Fly reports as healthy can still be a query API that
       # answers 500s, so assert on the public endpoint rather than on

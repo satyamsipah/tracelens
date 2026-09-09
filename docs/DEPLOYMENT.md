@@ -96,15 +96,20 @@ Images come from the GitHub Actions release workflow (below). To push a set
 by hand:
 
 ```bash
-export TAG=v1.0.0
+# Image tags carry NO leading "v": the git tag v1.0.0 publishes 1.0.0,
+# because that is what docker/metadata-action's semver pattern produces.
+export TAG=1.0.0
 for c in collector assembler query demo; do
-  docker build --target slim --build-arg TARGET=./cmd/$c \
+  docker buildx build --target slim --build-arg TARGET=./cmd/$c \
+    --platform linux/amd64,linux/arm64 --push \
     -t ghcr.io/satyamsipah/tracelens-$c:$TAG -f deploy/Dockerfile .
-  docker push ghcr.io/satyamsipah/tracelens-$c:$TAG
 done
 ```
 
 (`demo` builds from `./demo`, not `./cmd/demo` — adjust `TARGET`.)
+
+GHCR packages are **private on first publish**. Make them public once, in the
+package settings, or the Fly machines cannot pull them.
 
 ### Step 3 — Redpanda
 

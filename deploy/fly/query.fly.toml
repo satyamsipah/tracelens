@@ -4,7 +4,7 @@ app = "tracelens-query"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/satyamsipah/tracelens-query:v1.0.0"
+  image = "ghcr.io/satyamsipah/tracelens-query:1.0.0"
 
 [env]
   TRACELENS_QUERY_HTTP_ADDR = ":8080"

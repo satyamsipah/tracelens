@@ -14,7 +14,7 @@ app = "tracelens-demo"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/satyamsipah/tracelens-demo:v1.0.0"
+  image = "ghcr.io/satyamsipah/tracelens-demo:1.0.0"
 
 [env]
   OTEL_EXPORTER_OTLP_ENDPOINT = "http://tracelens-collector.internal:4317"

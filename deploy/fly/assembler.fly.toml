@@ -14,7 +14,7 @@ app = "tracelens-assembler"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/satyamsipah/tracelens-assembler:v1.0.0"
+  image = "ghcr.io/satyamsipah/tracelens-assembler:1.0.0"
 
 [env]
   TRACELENS_KAFKA_BROKERS = "tracelens-redpanda.internal:9092"
