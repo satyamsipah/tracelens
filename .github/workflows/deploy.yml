@@ -1,0 +1,174 @@
+name: Deploy
+
+# Tags only. A push to main builds and tests (see ci.yml) but deploys
+# nothing: the deployed version should be a thing someone chose to release,
+# not whatever merged last.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing image tag to deploy (skips the build)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Fly deploys are skipped rather than failed when no token is configured,
+  # so tagging a release still publishes images on a fork or on a clone that
+  # has no Fly account. The `secrets` context is not available in a job-level
+  # `if:`, hence this job: it launders the secret's presence into an output.
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      deploy_fly: ${{ steps.vars.outputs.deploy_fly }}
+    steps:
+      - id: vars
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$FLY_API_TOKEN" ]; then
+            echo "deploy_fly=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_fly=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::FLY_API_TOKEN is not set; images will be published but nothing will be deployed."
+          fi
+
+  images:
+    name: build ${{ matrix.component }}
+    needs: preflight
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: collector
+            target: ./cmd/collector
+          - component: assembler
+            target: ./cmd/assembler
+          - component: query
+            target: ./cmd/query
+          # The demo app lives at the repo root, not under cmd/.
+          - component: demo
+            target: ./demo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # No secret to configure: GHCR accepts the workflow's own token,
+          # which is why `packages: write` is in permissions above.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/tracelens-${{ matrix.component }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          # The distroless variant: no shell, no package manager. Safe here
+          # because Fly and Kubernetes both health-check over the network
+          # rather than by running a command inside the container.
+          target: slim
+          # arm64 is included so the published images also run on Apple
+          # silicon; the Dockerfile cross-compiles rather than emulating, so
+          # the second platform costs a link, not a rebuild.
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            TARGET=${{ matrix.target }}
+            BINARY=${{ matrix.component }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,scope=${{ matrix.component }},mode=max
+
+  deploy:
+    name: deploy to fly.io
+    needs: [preflight, images]
+    # `always()` so a workflow_dispatch (which skips `images`) still reaches
+    # this job; the explicit result check keeps a genuine build failure from
+    # deploying a stale tag.
+    if: |
+      always() &&
+      needs.preflight.outputs.deploy_fly == 'true' &&
+      needs.images.result != 'failure'
+    runs-on: ubuntu-latest
+    concurrency:
+      # Two overlapping deploys would race on the same machines; queue them.
+      group: fly-deploy
+      cancel-in-progress: false
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # Redpanda is deployed by hand once (it is a stateful third-party image
+      # with an attached volume, and nothing in this repo changes it), so it
+      # is deliberately absent here.
+
+      - name: collector
+        run: |
+          flyctl deploy --config deploy/fly/collector.fly.toml \
+            --image "ghcr.io/$OWNER/tracelens-collector:$TAG" --yes
+
+      # Before query: the assembler owns the ClickHouse migrations, so a
+      # schema change must land before anything reads against it.
+      - name: assembler
+        run: |
+          flyctl deploy --config deploy/fly/assembler.fly.toml \
+            --image "ghcr.io/$OWNER/tracelens-assembler:$TAG" --yes
+
+      - name: query
+        run: |
+          flyctl deploy --config deploy/fly/query.fly.toml \
+            --image "ghcr.io/$OWNER/tracelens-query:$TAG" --yes
+
+      - name: demo traffic
+        run: |
+          flyctl deploy --config deploy/fly/demo.fly.toml \
+            --image "ghcr.io/$OWNER/tracelens-demo:$TAG" --yes
+
+      # A deploy that Fly reports as healthy can still be a query API that
+      # answers 500s, so assert on the public endpoint rather than on
+      # flyctl's exit code.
+      - name: smoke test the public API
+        run: |
+          for i in $(seq 1 12); do
+            code=$(curl -sS -o /tmp/body -w '%{http_code}' \
+              https://tracelens-query.fly.dev/api/services || echo 000)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              head -c 400 /tmp/body; exit 0
+            fi
+            sleep 10
+          done
+          echo "query API did not return 200 after deploy"
+          flyctl logs -a tracelens-query --no-tail | tail -50
+          exit 1
