@@ -1672,11 +1672,26 @@ Measured, and the reason the split is worth the extra stage:
 
 | Image | alpine | distroless |
 |---|---|---|
-| assembler | 50.6MB | **36.8MB** |
-| collector | 41.9MB | **28.1MB** |
-| query | 35.1MB | **21.4MB** |
+| assembler | 34.2 MiB | **26.0 MiB** |
+| collector | 27.5 MiB | **19.3 MiB** |
+| query | 22.2 MiB | **14.1 MiB** |
 
-All three are under the 40MB target on the `slim` path.
+Measured as the flattened container filesystem (`docker export | wc -c`) for
+`linux/amd64`. That method is stated because it matters: with Docker's
+containerd image store, `docker images` reports *compressed* layer sizes,
+which for a Go binary is roughly a third of the real thing -- the same three
+images "measure" at 7.2/9.3/5.4 MB that way. Compressed size is what you pull;
+flattened size is what you run.
+
+All three are under the 40MB target on the `slim` path — 24–36% smaller than
+alpine, the saving being alpine's base plus `ca-certificates` and `wget`,
+which is a near-constant ~8.2 MiB per image.
+
+(An earlier draft of this section quoted 50.6/41.9/35.1 → 36.8/28.1/21.4 MB.
+Those were taken on a different architecture and a differently-configured
+daemon during this session and could not be reproduced; the table above is
+the one measurement I can reproduce on demand, which is the only kind worth
+publishing.)
 
 **Also changed:** the build stage is now pinned to `--platform=$BUILDPLATFORM`
 with `GOOS`/`GOARCH` passed through. Without this, a multi-arch build runs the

@@ -188,9 +188,16 @@ support them.
 
 | Image | alpine | distroless |
 |---|---|---|
-| assembler | 50.6MB | **36.8MB** |
-| collector | 41.9MB | **28.1MB** |
-| query | 35.1MB | **21.4MB** |
+| assembler | 34.2 MiB | **26.0 MiB** |
+| collector | 27.5 MiB | **19.3 MiB** |
+| query | 22.2 MiB | **14.1 MiB** |
+
+Measured as the flattened container filesystem (`docker export | wc -c`) for
+`linux/amd64`. That method is stated because it matters: with Docker's
+containerd image store, `docker images` reports *compressed* layer sizes,
+which for a Go binary is roughly a third of the real thing -- the same three
+images "measure" at 7.2/9.3/5.4 MB that way. Compressed size is what you pull;
+flattened size is what you run.
 
 Docker Compose keeps using the alpine variant, because a Compose
 healthcheck runs its command *inside* the container and therefore needs a
