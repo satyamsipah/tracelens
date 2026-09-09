@@ -113,6 +113,10 @@ done
 GHCR packages are **private on first publish**. Until you change that, Fly
 machines cannot pull them and neither can anyone reading this repo.
 
+> Already done for this repository — the `v1.0.0` images are public and pull
+> anonymously. The steps below are for a fork, or for the first release of a
+> newly-named package.
+
 This cannot be scripted. There is **no REST endpoint for package
 visibility** — the Packages API can read, delete and restore packages, but
 not change visibility — so it is a web-UI action regardless of token scopes.
