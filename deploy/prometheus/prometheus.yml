@@ -13,6 +13,13 @@ scrape_configs:
     static_configs:
       - targets: ["assembler:9465"]
 
+  # The query API exports per-query latency, rows scanned and preflight
+  # rejections. It was missing here, so none of it reached Prometheus and the
+  # self-monitoring dashboard could never show the query path at all.
+  - job_name: query
+    static_configs:
+      - targets: ["query:9466"]
+
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
