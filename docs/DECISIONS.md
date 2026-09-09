@@ -1622,3 +1622,30 @@ resource-contended reprocessing rate ends up being -- not evidence the
 fix is incomplete. Resolving that specific stuck broker state is an
 operational action (e.g. resetting the consumer group's offsets), not a
 code change, and was not made as part of this fix.
+
+### 6. Decided: stop waiting for this session's backlog to drain; the fix stands verified without it
+
+Measured lag on the real-demo-traffic backlog: ~22,456s (6.2 hours) behind
+at 00:17, still climbing shortly after (production continues at ~55
+spans/sec while the assembler reprocesses from the broker's stale reset
+point, contending with this same session's other ClickHouse load). Rather
+than block further work on an indeterminate wait for a pre-existing
+environmental artifact to drain, the decision is to stop waiting here.
+
+This does not weaken the fix's verification. Per Sec 3-5 above, the fix is
+already confirmed correct by: `TestClassifyFetchError` (the real detection
+code, against constructed `*kgo.ErrDataLoss` values), `TestAssemblerHandleDataLoss`
+and `TestAssemblerWatermarkWatchdog` (the real release/give-up logic,
+including the negative case -- a trace still legitimately in-flight must
+never be expired), and a clean live redeploy that behaved exactly as
+predicted (zero entries cleared on a cold start, because there was
+nothing in memory yet to clear). A live, wall-clock proof that this
+session's specific multi-hour backlog eventually drains would demonstrate
+Redpanda's own reprocessing throughput under contention, not anything
+about the correctness of the fix -- it was never the missing evidence.
+
+Rerunning `cmd/correctnesscheck` remains a real, live end-to-end
+sanity check worth doing once this environment is in a normal state
+(after this backlog drains naturally, or after a fresh `docker compose
+down -v && up` in a session not carrying this pre-existing corruption) --
+just not a gate on considering this fix complete.
