@@ -7,7 +7,7 @@
 #
 # TWO final stages, selected with --target:
 #
-#   runtime  (default) -- alpine. Has a shell and wget, which Docker Compose
+#   runtime  -- alpine. Has a shell and wget, which Docker Compose
 #            healthchecks need, since a Compose healthcheck runs its command
 #            INSIDE the container.
 #   slim     -- distroless static. ~2MB base instead of ~8MB plus packages,
@@ -15,6 +15,13 @@
 #            surface), and it is what deploy/k8s and deploy/helm use --
 #            Kubernetes httpGet probes are executed by the kubelet over the
 #            network, so they need no tooling inside the container at all.
+#
+# NEITHER stage is "the default" in a useful sense: with no --target, BuildKit
+# builds the LAST stage in this file, which is `slim`. Every caller therefore
+# names its target explicitly -- docker-compose.yml pins `runtime`, and the
+# release workflow pins `slim`. An earlier version of this file relied on the
+# implicit default and silently handed Compose a shell-less image, which
+# failed as an unhealthy container rather than as a build error.
 #
 # Both run as a non-root user. See deploy/README.md for measured sizes.
 #

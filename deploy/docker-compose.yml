@@ -61,6 +61,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # Explicit: BuildKit defaults to the LAST stage in the file,
+      # which is the distroless one. Compose healthchecks run their
+      # command INSIDE the container and need a shell and wget.
+      target: runtime
       args:
         TARGET: ./cmd/collector
     container_name: tracelens-collector
@@ -93,6 +97,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # Explicit: BuildKit defaults to the LAST stage in the file,
+      # which is the distroless one. Compose healthchecks run their
+      # command INSIDE the container and need a shell and wget.
+      target: runtime
       args:
         TARGET: ./cmd/assembler
     container_name: tracelens-assembler
@@ -129,6 +137,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # Explicit: BuildKit defaults to the LAST stage in the file,
+      # which is the distroless one. Compose healthchecks run their
+      # command INSIDE the container and need a shell and wget.
+      target: runtime
       args:
         TARGET: ./cmd/query
     container_name: tracelens-query
@@ -160,6 +172,10 @@ services:
     build: &demo-build
       context: ..
       dockerfile: deploy/Dockerfile
+      # Explicit: BuildKit defaults to the LAST stage in the file,
+      # which is the distroless one. Compose healthchecks run their
+      # command INSIDE the container and need a shell and wget.
+      target: runtime
       args:
         TARGET: ./demo
     container_name: tracelens-gateway
