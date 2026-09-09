@@ -1,0 +1,64 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything involving ingestion or sampling, the metrics at the
+        bottom of this form usually identify the problem on their own.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got.
+      placeholder: |
+        Ran: {service="checkout"} since 1h | count by (operation)
+        Expected: one row per operation
+        Got: 400 "would scan 82,000,000 rows"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - collector (OTLP ingestion)
+        - assembler (tail sampling, storage writes)
+        - query (DSL, planner, API)
+        - web UI
+        - storage / schema / migrations
+        - deployment (Compose, Helm, Fly)
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Ideally from a clean `make up`.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Tag, or `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: signals
+    attributes:
+      label: Relevant metrics or logs
+      description: |
+        Whichever apply. See docs/RUNBOOK.md for what each one means.
+      placeholder: |
+        otlp_spans_dropped_total{reason="queue_full"} 41823
+        tracelens_consumer_lag_seconds{topic="spans"} 312
+        tracelens_forced_decisions_total 0
+      render: shell

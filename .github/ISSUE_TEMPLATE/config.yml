@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Design questions and discussion
+    url: https://github.com/satyamsipah/tracelens/discussions
+    about: Why something is built the way it is, or how it would work at a different scale.
+  - name: Design decisions and rejected alternatives
+    url: https://github.com/satyamsipah/tracelens/blob/main/docs/DECISIONS.md
+    about: Most "why is this like this?" questions are already answered here.

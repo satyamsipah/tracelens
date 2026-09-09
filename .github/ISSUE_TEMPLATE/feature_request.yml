@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a capability TraceLens does not have
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The README's "What this does NOT do, and why" section lists the known
+        gaps and the reasoning behind each. If your request is one of them,
+        say why the reasoning no longer holds — that is the useful part.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can't you do today? Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+    validations:
+      required: true
+
+  - type: textarea
+    id: principles
+    attributes:
+      label: Interaction with the six principles
+      description: |
+        CONTRIBUTING.md lists them. Most interesting features touch at least
+        one — especially bounded memory, trace_id affinity, and sampling
+        weights on aggregates. Say which, and how it stays satisfied.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: And why you rejected them.
