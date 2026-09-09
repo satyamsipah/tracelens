@@ -108,8 +108,30 @@ done
 
 (`demo` builds from `./demo`, not `./cmd/demo` — adjust `TARGET`.)
 
-GHCR packages are **private on first publish**. Make them public once, in the
-package settings, or the Fly machines cannot pull them.
+### Make the GHCR packages public (one-time, manual)
+
+GHCR packages are **private on first publish**. Until you change that, Fly
+machines cannot pull them and neither can anyone reading this repo.
+
+This cannot be scripted. There is **no REST endpoint for package
+visibility** — the Packages API can read, delete and restore packages, but
+not change visibility — so it is a web-UI action regardless of token scopes.
+
+For each of `tracelens-collector`, `tracelens-assembler`, `tracelens-query`
+and `tracelens-demo`:
+
+1. Open <https://github.com/satyamsipah?tab=packages> and click the package.
+2. Click **Package settings** (the gear on the right).
+3. Scroll to **Danger Zone** → **Change visibility**.
+4. Choose **Public**, type the package name to confirm.
+
+While you are there, **Manage Actions access** → add the `tracelens`
+repository with **Write** if you want future workflow runs to keep pushing
+without re-authorising.
+
+> **This is one-way.** GitHub does not allow a public package to be made
+> private again. That is fine for a public demo, but worth knowing before
+> clicking.
 
 ### Step 3 — Redpanda
 

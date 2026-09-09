@@ -1990,8 +1990,12 @@ sitting in it.
   token, exactly as designed. The `flyctl deploy` steps and the post-deploy
   smoke test remain unexercised.
 - **GHCR packages are private by default.** The `v1.0.0` images exist but
-  cannot be pulled anonymously until their visibility is changed in the
-  package settings, which needs `write:packages` — a scope the local `gh`
-  token does not carry.
+  cannot be pulled anonymously until their visibility is changed. This is
+  **not a token-scope problem**, as first assumed: the Packages REST API has
+  no visibility endpoint at all — it can list, get, delete and restore
+  packages, and that is the whole surface — so the change is web-UI only no
+  matter what the token carries. It is also **irreversible**: GitHub does not
+  let a public package become private again. Steps in
+  [DEPLOYMENT.md](DEPLOYMENT.md#make-the-ghcr-packages-public-one-time-manual).
 - **The repository's Website field is empty**, since there is no live demo URL
   to put in it yet. `gh repo edit --homepage <url>` sets it after deploying.
