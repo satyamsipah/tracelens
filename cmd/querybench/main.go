@@ -37,6 +37,17 @@ const (
 )
 
 func main() {
+	// os.Exit skips deferred functions, so every early exit lives in run()
+	// and main() only reports. Without this the deferred conn.Close() below
+	// would never run on any error path, leaving the ClickHouse session to
+	// time out instead of closing.
+	if err := run(); err != nil {
+		log.Printf("querybench: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	rows := flag.Int("rows", 10_000_000, "target row count in tracelens.spans")
 	iters := flag.Int("iters", 5, "iterations per (pass, on/off) measurement, median reported")
 	flag.Parse()
@@ -45,12 +56,12 @@ func main() {
 	cfg := config.LoadClickHouse()
 	conn, err := storage.WaitForClickHouse(ctx, cfg, 30*time.Second)
 	if err != nil {
-		log.Fatalf("connect: %v (is `docker compose up` running?)", err)
+		return fmt.Errorf("connect: %w (is `docker compose up` running?)", err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	if err := ensureRows(ctx, conn, cfg, *rows); err != nil {
-		log.Fatalf("seed data: %v", err)
+		return fmt.Errorf("seed data: %w", err)
 	}
 
 	cases := []struct {
@@ -71,11 +82,11 @@ func main() {
 	for _, c := range cases {
 		off, err := measure(ctx, conn, c.dsl, *iters, c.pass)
 		if err != nil {
-			log.Fatalf("%s (off): %v", c.name, err)
+			return fmt.Errorf("%s (off): %w", c.name, err)
 		}
 		on, err := measure(ctx, conn, c.dsl, *iters)
 		if err != nil {
-			log.Fatalf("%s (on): %v", c.name, err)
+			return fmt.Errorf("%s (on): %w", c.name, err)
 		}
 
 		bytesReduction := "-"
@@ -92,6 +103,7 @@ func main() {
 			formatBytes(off.bytes), formatBytes(on.bytes), bytesReduction,
 			off.latency.Round(time.Millisecond), on.latency.Round(time.Millisecond), speedup)
 	}
+	return nil
 }
 
 type measurement struct {
@@ -132,7 +144,7 @@ func measure(ctx context.Context, conn driver.Conn, dsl string, iters int, skip 
 		for rows.Next() {
 		}
 		err = rows.Err()
-		rows.Close()
+		_ = rows.Close()
 		if err != nil {
 			return measurement{}, err
 		}
@@ -257,6 +269,6 @@ func ensureRows(ctx context.Context, conn driver.Conn, chCfg config.ClickHouse, 
 	}
 
 	log.Printf("seed complete: %d rows inserted", inserted)
-	os.Stdout.Sync()
+	_ = os.Stdout.Sync()
 	return nil
 }

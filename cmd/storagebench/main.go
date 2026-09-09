@@ -99,7 +99,7 @@ func reportTopColumns(ctx context.Context, conn driver.Conn) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	fmt.Println("| Column | Compressed | Raw |")
 	fmt.Println("|---|---|---|")

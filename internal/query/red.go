@@ -67,7 +67,7 @@ func QueryRED(ctx context.Context, conn driver.Conn, level RollupLevel, service,
 	if err != nil {
 		return nil, fmt.Errorf("query: red rollup: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []REDStat
 	for rows.Next() {

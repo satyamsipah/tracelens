@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -227,8 +228,8 @@ func TestParserErrorMessagesPointAtColumn(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected an error")
 			}
-			pe, ok := err.(*ParseError)
-			if !ok {
+			var pe *ParseError
+			if !errors.As(err, &pe) {
 				t.Fatalf("got %T, want *ParseError: %v", err, err)
 			}
 			if pe.Col != tt.wantCol {

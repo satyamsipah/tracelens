@@ -236,7 +236,7 @@ func simplifyAnd(terms []Expr) []Expr {
 			// An impossible range (lower > upper, or equal with either
 			// exclusive) also folds to "no rows".
 			if fs.lower.set && (fs.lower.val > fs.upper.val ||
-				(fs.lower.val == fs.upper.val && !(fs.lower.inclusive && fs.upper.inclusive))) {
+				(fs.lower.val == fs.upper.val && (!fs.lower.inclusive || !fs.upper.inclusive))) {
 				return []Expr{Literal{Value: false}}
 			}
 			op := "<"

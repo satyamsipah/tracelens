@@ -67,7 +67,7 @@ func BuildServiceGraph(ctx context.Context, conn driver.Conn, window time.Durati
 	if err != nil {
 		return nil, fmt.Errorf("query: service graph: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	// Nodes/Edges/Cycles start as empty (not nil) slices for the same reason
 	// as internal/query.Result.Rows: a nil slice marshals to JSON `null`,

@@ -2,6 +2,7 @@ package sampling
 
 import (
 	"container/heap"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -197,7 +198,11 @@ func (h offsetHeap) Swap(i, j int) {
 	h[j].heapIndex = j
 }
 func (h *offsetHeap) Push(x any) {
-	e := x.(*offsetEntry)
+	// heap.Interface forces `any`; see ageHeap.Push in buffer.go.
+	e, ok := x.(*offsetEntry)
+	if !ok {
+		panic(fmt.Sprintf("offsetHeap.Push: got %T, want *offsetEntry", x))
+	}
 	e.heapIndex = len(*h)
 	*h = append(*h, e)
 }

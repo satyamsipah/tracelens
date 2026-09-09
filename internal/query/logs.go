@@ -44,7 +44,7 @@ func QueryLogTemplates(ctx context.Context, conn driver.Conn, since, until time.
 	if err != nil {
 		return nil, fmt.Errorf("query: log templates: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []LogTemplateStat{}
 	for rows.Next() {
@@ -85,7 +85,7 @@ func QueryLogInstances(ctx context.Context, conn driver.Conn, templateID uint32,
 	if err != nil {
 		return nil, fmt.Errorf("query: log instances: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []LogInstance{}
 	for rows.Next() {
@@ -122,7 +122,7 @@ func QueryLogsForTrace(ctx context.Context, conn driver.Conn, traceIDHex string)
 	if err != nil {
 		return nil, fmt.Errorf("query: logs for trace: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := []LogInstance{}
 	for rows.Next() {

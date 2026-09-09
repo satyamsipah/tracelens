@@ -27,7 +27,7 @@ func QueryStorageStats(ctx context.Context, conn driver.Conn) ([]StorageStat, er
 	if err != nil {
 		return nil, fmt.Errorf("query: storage stats: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []StorageStat
 	for rows.Next() {
@@ -64,7 +64,7 @@ func QueryCompressionStats(ctx context.Context, conn driver.Conn) ([]Compression
 	if err != nil {
 		return nil, fmt.Errorf("query: compression stats: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []CompressionStat
 	for rows.Next() {

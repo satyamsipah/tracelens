@@ -91,6 +91,9 @@ func run(log *slog.Logger) error {
 			log.Error("admin server", slog.String("error", err.Error()))
 		}
 	}()
+	// A query API that cannot reach ClickHouse can only return errors, so
+	// it should leave the Service's endpoints rather than serve 500s.
+	admin.SetReadinessCheck(conn.Ping, 0)
 	admin.SetReady(true)
 
 	go func() {
@@ -202,7 +205,7 @@ func (h *handler) handleServices(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	services := []string{}
 	for rows.Next() {
@@ -413,7 +416,7 @@ func (h *handler) promQuery(ctx context.Context, promql string) promResult {
 	if err != nil {
 		return out
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return out

@@ -78,7 +78,7 @@ func executeSelect(ctx context.Context, conn driver.Conn, sq SelectQuery, opts O
 	if err != nil {
 		return nil, fmt.Errorf("query: execute: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanRows(rows)
 }
 
@@ -100,7 +100,7 @@ func executeTrace(ctx context.Context, conn driver.Conn, tq TraceQuery, opts Opt
 	if err != nil {
 		return nil, fmt.Errorf("query: trace lookup: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanRows(rows)
 }
 
@@ -188,7 +188,7 @@ func EstimateRows(ctx context.Context, conn driver.Conn, phys Physical) (uint64,
 	if err != nil {
 		return 0, fmt.Errorf("query: explain estimate: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var total uint64
 	for rows.Next() {

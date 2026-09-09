@@ -2,6 +2,7 @@ package sampling
 
 import (
 	"container/heap"
+	"fmt"
 	"sync"
 	"time"
 
@@ -232,7 +233,7 @@ func (b *Buffer) PopReady(now time.Time) []*bufferedTrace {
 
 	var ready []*bufferedTrace
 	for b.byAge.Len() > 0 && now.Sub(b.byAge[0].firstSeen) >= b.cfg.DecisionWait {
-		t := heap.Pop(&b.byAge).(*bufferedTrace)
+		t := b.popOldestLocked()
 		delete(b.inflight, t.traceID)
 		b.totalBytes -= t.sizeBytes
 		ready = append(ready, t)
@@ -360,8 +361,24 @@ func (h ageHeap) Swap(i, j int) {
 	h[i].heapIndex = i
 	h[j].heapIndex = j
 }
+
+// popOldestLocked is a typed wrapper over heap.Pop, which must return `any`.
+// Caller must hold b.mu.
+func (b *Buffer) popOldestLocked() *bufferedTrace {
+	t, ok := heap.Pop(&b.byAge).(*bufferedTrace)
+	if !ok {
+		panic("ageHeap holds a non-*bufferedTrace; nothing outside this package pushes to it")
+	}
+	return t
+}
+
 func (h *ageHeap) Push(x any) {
-	t := x.(*bufferedTrace)
+	// heap.Interface forces `any`. Nothing outside this package pushes here,
+	// so a type mismatch is a programming error, not input to validate.
+	t, ok := x.(*bufferedTrace)
+	if !ok {
+		panic(fmt.Sprintf("ageHeap.Push: got %T, want *bufferedTrace", x))
+	}
 	t.heapIndex = len(*h)
 	*h = append(*h, t)
 }

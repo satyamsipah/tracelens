@@ -61,7 +61,7 @@ func Explain(ctx context.Context, conn driver.Conn, dsl string) (*ExplainResult,
 	// parameter does not provide.
 	if inlined, ierr := inlineForExplain(phys.SQL, phys.Args); ierr == nil {
 		if rows, err := conn.Query(ctx, "EXPLAIN indexes=1, actions=1 "+inlined); err == nil {
-			defer rows.Close()
+			defer func() { _ = rows.Close() }()
 			for rows.Next() {
 				var line string
 				if rows.Scan(&line) == nil {

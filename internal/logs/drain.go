@@ -295,7 +295,7 @@ func (d *drain) allocateID() uint32 {
 // Returns the evicted id so the caller can count it.
 func (d *drain) evictLRU() uint32 {
 	var oldest *cluster
-	var oldestGen uint64 = ^uint64(0)
+	oldestGen := ^uint64(0)
 	for _, cl := range d.clusters {
 		if cl.lruGen < oldestGen {
 			oldestGen, oldest = cl.lruGen, cl

@@ -202,7 +202,7 @@ func (t *CardinalityTracker) Observe(key, value string) float64 {
 // sketch. Caller must hold t.mu.
 func (t *CardinalityTracker) evictLRULocked() {
 	var oldestKey string
-	var oldestGen uint64 = ^uint64(0)
+	oldestGen := ^uint64(0)
 	for k, ts := range t.sketches {
 		if ts.lruGen < oldestGen {
 			oldestGen, oldestKey = ts.lruGen, k
