@@ -1649,3 +1649,280 @@ sanity check worth doing once this environment is in a normal state
 (after this backlog drains naturally, or after a fresh `docker compose
 down -v && up` in a session not carrying this pre-existing corruption) --
 just not a gate on considering this fix complete.
+
+---
+
+## 2026-09-09 — Phase 6: shipping — deployment, documentation, repository as artefact
+
+### 1. Decided: two final Docker stages, not one
+
+`deploy/Dockerfile` now has two named final stages selected with `--target`:
+
+| Stage | Base | Used by |
+|---|---|---|
+| `runtime` (default) | `alpine:3.20` | Docker Compose |
+| `slim` | `gcr.io/distroless/static-debian12:nonroot` | Kubernetes, Fly.io, GHCR releases |
+
+The obvious move was distroless everywhere. **Rejected**, because a Docker
+Compose healthcheck runs its command *inside* the container, so it needs a
+shell and `wget`; distroless has neither. Kubernetes and Fly probe over the
+network from outside, so they lose nothing.
+
+Measured, and the reason the split is worth the extra stage:
+
+| Image | alpine | distroless |
+|---|---|---|
+| assembler | 50.6MB | **36.8MB** |
+| collector | 41.9MB | **28.1MB** |
+| query | 35.1MB | **21.4MB** |
+
+All three are under the 40MB target on the `slim` path.
+
+**Also changed:** the build stage is now pinned to `--platform=$BUILDPLATFORM`
+with `GOOS`/`GOARCH` passed through. Without this, a multi-arch build runs the
+**Go compiler itself** under QEMU emulation, costing minutes per image per
+architecture. A static Go binary cross-compiles natively, so the second
+architecture now costs a link rather than a rebuild.
+
+### 2. Decided: the assembler gets no Kubernetes Service, structurally
+
+The Helm chart deliberately ships **no** `Service` for the assembler, and
+`deploy/k8s/README.md` documents why at length.
+
+The assembler is a Kafka consumer, not a server. Its trace_id affinity comes
+from Kafka partitioning, and nothing Kubernetes does provides it. Put a
+Service in front and push spans through it, and it round-robins one trace's
+spans across replicas: each replica decides on a fragment, error traces get
+dropped by the replica that never saw the `ERROR` span, every fragment
+carries its own sampling weight so aggregates double-count, and the bounded
+buffer fills with fragments that never complete.
+
+**The insidious part is that nothing looks broken.** Ingestion succeeds, rows
+land, dashboards populate. Only the sampling decisions are quietly wrong.
+Documenting the invariant was judged insufficient — the invariant is now
+enforced by there being no Service to misuse.
+
+Two corollaries encoded in the chart: `assembler.replicaCount` must never
+exceed `kafka.partitions` (the HPA's `maxReplicas` is capped at the partition
+count with `min`), and changing the partition count is a migration rather
+than a knob.
+
+### 3. Decided: autoscale the assembler on consumer lag, and ship neither adapter
+
+`assembler.autoscaling` targets the external metric
+`tracelens_consumer_lag_seconds`, not CPU. **CPU was rejected as the signal:**
+the assembler spends most of its time *waiting* — on the decision window, on
+ClickHouse — so CPU stays flat while the backlog grows and a CPU-based HPA
+would never fire.
+
+External metrics need an adapter serving `external.metrics.k8s.io`. The chart
+installs **neither** prometheus-adapter nor KEDA, and documents both options
+instead. Bundling one would make an application chart own a cluster-wide
+metrics component that other workloads also depend on — the same reasoning
+that keeps ClickHouse and Redpanda out of the chart as subcharts.
+
+Scale-down uses a 600s stabilization window and one pod at a time: every
+scale event triggers a consumer-group rebalance that stops consumption on the
+partitions that move, so shedding replicas eagerly after a burst costs
+throughput exactly while the backlog is still draining.
+
+### 4. Decided: readiness probes dependencies, liveness never does
+
+`internal/observability/admin.go` gained `SetReadinessCheck(check, ttl)`.
+Per component: collector pings Kafka, assembler pings both ClickHouse and
+Kafka, query pings ClickHouse. `/readyz` returns 503 naming the failed
+dependency.
+
+`/healthz` deliberately consults **nothing**. A liveness failure kills the
+container, so wiring ClickHouse into liveness would turn one dependency's
+outage into a crash-loop across the entire fleet — every pod killed, none
+able to start, while the actual problem is elsewhere. A readiness failure is
+self-correcting the moment the dependency returns.
+
+Probe results are cached with a TTL (2s in the chart) so a large replica
+count polling on a 5s kubelet cadence does not turn into proportional `Ping`
+load on the dependency that is already struggling. The probe runs outside the
+mutex, so a slow dependency cannot serialise every concurrent probe.
+
+### 5. Decided: cold tiering exports Parquet via ClickHouse itself, and verifies before dropping
+
+`cmd/coldexport` + `internal/storage/coldtier.go`.
+
+**Parquet on object storage, not ClickHouse's native BACKUP.** The point of
+cold data is that something *other than this cluster* can still read it in
+three years — DuckDB, Spark, Athena, pandas all read Parquet; a native backup
+is readable only by ClickHouse, and only by a version that still understands
+that on-disk format.
+
+**ClickHouse does the transfer**, via the `s3()` table function. Streaming
+rows out through a Go process and back would add a network hop, a
+serialisation round trip, and a machine that must stay up for the duration —
+for a partition of tens of millions of spans, the difference between a
+metadata-speed operation and an afternoon.
+
+**Nothing is dropped unverified.** `Drop` re-reads the exported object and
+counts it, *and* re-counts the source. Two distinct guards for two distinct
+failures: the object read-back catches an export deleted or corrupted by a
+lifecycle rule since it was written; the source re-count catches rows that
+arrived between export and drop. Without the second, a partition that gained
+late spans would lose exactly those rows, silently — principle 1 applied to
+storage rather than to ingestion.
+
+A **manifest** is written next to each Parquet file naming the exact columns
+exported. `SELECT *` on restore was **rejected**: the first migration to add
+a column would make every earlier export un-restorable on a column-count
+mismatch. With an explicit list, a newer table absorbs an older export (new
+columns take their `DEFAULT`) and columns the table has since dropped are
+skipped with a warning rather than failing the restore.
+
+**Two real bugs the MinIO-backed test caught**, neither of which review would
+have:
+
+1. **`s3_truncate_on_insert` defaults to off.** Re-exporting a partition
+   failed with "object already exists" — breaking the exact workflow `Drop`'s
+   own guard pushes you into (late rows arrive → drop refused → re-export).
+   Now set explicitly; the partition is the source of truth, so overwriting
+   its export is always correct.
+2. **`JSONAsString` is an input-only format** and cannot be written. The
+   manifest round-trips as `RawBLOB` instead, which works both ways and keeps
+   the manifest opaque to ClickHouse — adding a field to `Manifest` is a Go
+   change with nothing on the ClickHouse side to keep in step.
+
+The test asserts value-level survival (`Enum8`, `Map`, `Array(Map)`,
+`sampling_weight`), not just row counts: a count-only check passes on a
+restore that silently emptied every map.
+
+**Not done:** no AWS account or credentials exist in this environment, so
+this has never run against real S3 — only against MinIO, which is
+S3-compatible but not S3.
+
+### 6. Decided: restructure the README as a front door, move depth into docs/
+
+The README had grown to 675 lines — a genuinely good design document, and a
+wall that an interviewer or a drive-by reader bounces off in ten seconds.
+
+It is now ~330 lines: hero, three-sentence problem statement, three-command
+quickstart, a Mermaid architecture diagram, the design decisions that shape
+everything else, a benchmark table with its methodology caveats stated inline,
+an explicit "what this does NOT do and why", and "what I'd do differently at
+100x scale". Everything cut moved into
+[ARCHITECTURE.md](ARCHITECTURE.md), [QUERY-LANGUAGE.md](QUERY-LANGUAGE.md)
+and [RUNBOOK.md](RUNBOOK.md) rather than being deleted.
+
+**Diagrams were rendered before being committed**, not assumed. Two real
+defects that found:
+
+- Markdown `**bold**` inside a Mermaid edge label renders as **literal
+  asterisks**. Mermaid does not process markdown in edge labels.
+- The README diagram as `flowchart LR` came out 2931×264px — an 11:1 ratio
+  that GitHub scales into illegibility. `flowchart TB` renders at 466×1448
+  and stays legible at natural size. Vertical is also simply the right shape
+  for a pipeline.
+
+### 7. Decided: the DSL reference's examples are covered by a test
+
+`TestDocExamplesParse` parses every query printed in QUERY-LANGUAGE.md, plus
+the rejections that document promises. A reference whose examples do not
+parse is worse than no reference.
+
+It immediately caught a **wrong claim in my own prose**: I had written that
+`duration > 500` is a parse error for missing a unit. It is not. A bare
+number in a *filter stage* is legal and means the column's native unit —
+which is what makes `http.status_code >= 500` work — so `duration > 500`
+silently means 500 **nanoseconds**, matching essentially every span. Only
+`since` / `range` reject a unitless number, because a time range has no
+native unit to fall back on.
+
+This is a genuine sharp edge. It is now documented as one rather than
+silently "fixed" at ship time, since rejecting bare numbers wholesale would
+break attribute comparisons, and special-casing `duration` at this point
+would be a DSL semantics change made without measurement.
+
+### 8. Fixed: probabilistic sampling silently halved itself on linux/amd64
+
+**The most consequential find of this phase, and it came from a red CI badge
+rather than from review.**
+
+Adding a CI badge to the README meant looking at CI, which had been failing on
+every run for several phases. One failure was
+`TestRateLimiterComposesWithProbabilistic` — passing locally, failing in CI.
+
+Root cause, in `probabilistic.Evaluate`:
+
+```go
+threshold := uint64(p.rate * float64(^uint64(0)))
+```
+
+`float64` cannot represent `2^64-1`, so it rounds **up** to exactly `2^64`. At
+`rate = 1.0` the product is therefore `2^64`, which is out of range for
+`uint64` — and **Go explicitly defines out-of-range float-to-integer
+conversion as implementation-dependent**. Verified directly on this machine,
+same binary source, two architectures:
+
+| Architecture | `uint64(1.0 * float64(^uint64(0)))` | Effective sample rate at `rate: 1.0` |
+|---|---|---|
+| arm64 (dev Mac) | `18446744073709551615` (saturates) | 100% — correct by luck |
+| amd64 (CI, Docker, Fly, k8s) | `9223372036854775808` (2^63) | **50%** |
+
+So "sample everything" kept half the traces on **every deployment target**,
+while still stamping `Probability: 1.0` on the decision — meaning
+`Weight() = 1`. Every weighted aggregate over that data would have been
+silently wrong by a factor of two. That is principle 6 violated by an
+arithmetic edge case, and principle 1 violated silently: no counter moved, no
+error logged, and the sampled data looked entirely normal.
+
+**Production was not affected today** — `deploy/tracelens/policies.yaml` uses
+`rate: 0.05`, comfortably inside the range where the conversion is valid — but
+`rate: 1.0` is an entirely reasonable thing for an operator to configure, and
+it would have failed quietly.
+
+The fix resolves both boundaries before any conversion, so the remaining
+multiply is provably in range for `rate` strictly inside (0, 1).
+
+`TestProbabilisticBoundaryRates` is deliberately written to be
+architecture-independent: it asserts every trace is kept at rate 1.0 rather
+than asserting an approximate rate, so a threshold collapsing to half fails
+everywhere rather than only where it happens to be wrong. Verified by
+compiling the package for `GOARCH=amd64` and running it under Rosetta.
+
+**The general lesson, recorded because it generalises past this bug:** a test
+suite that only ever runs on the developer's architecture is not testing the
+architecture that runs in production. CI was the only thing that could have
+caught this, and it had been red long enough to stop being read.
+
+### 9. Fixed: a storage test asserted on ClickHouse's merge scheduler
+
+The other CI failure was `TestWriterDeduplicatesDuplicateInput`, which
+asserted that three separately-inserted duplicate rows are individually
+visible *before* a merge. On an idle CI runner ClickHouse merged the three
+single-row parts before the count ran, and the assertion saw 1.
+
+That assertion was testing ClickHouse's background merge **scheduling**, which
+is nondeterministic by design and not our code. It now asserts on
+`clickhouse_rows_inserted_total` instead — proving the real invariant, that
+distinct deduplication tokens do not suppress the insert — while the
+meaningful assertion (`FINAL` collapses to exactly one row) is unchanged.
+
+### 10. Fixed: fan-out alert errors lost everything after the first
+
+`fanOutSink` combined sink failures with
+`fmt.Errorf("%w; %v", joined, e)` — one `%w` and then `%v` for every
+subsequent error. Only the first sink's failure stayed inspectable by
+`errors.Is`/`errors.As`; the rest were flattened to text. With fan-out to
+several sinks, the first is not the one you want to keep. Now `errors.Join`.
+
+Found by enabling `errorlint`, which was already configured but whose findings
+had never been acted on because the lint job was red.
+
+### 11. Not done, and why
+
+- **The live demo is not deployed.** Every artefact is written and validated
+  — five `fly.toml` files, a Helm chart (`helm lint` clean, kubeconform
+  17/17), rendered manifests (16/16), a tag-triggered GitHub Actions pipeline
+  — but deploying needs a Fly.io account, a ClickHouse Cloud service, and a
+  Vercel login. Those are credentials to be entered by their owner, not
+  guessed at. `docs/DEPLOYMENT.md` is the step-by-step.
+- **`cmd/coldexport` has never run against real S3**, only MinIO (see §5).
+- **The GitHub Actions deploy workflow has never executed.** It is written
+  against documented action APIs and reviewed, but a workflow's first real
+  run is its first real test.
