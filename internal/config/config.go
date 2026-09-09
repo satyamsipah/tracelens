@@ -141,6 +141,12 @@ type ClickHouse struct {
 	Username string
 	Password string
 
+	// TLS turns on an encrypted native-protocol connection. Required by
+	// every managed ClickHouse (ClickHouse Cloud listens for the native
+	// protocol on 9440 with TLS, not 9000 in the clear); off by default so
+	// the local Compose stack keeps working unchanged.
+	TLS bool
+
 	DialTimeout  time.Duration
 	QueryTimeout time.Duration
 
@@ -328,6 +334,7 @@ func LoadKafka() Kafka {
 func LoadClickHouse() ClickHouse {
 	return ClickHouse{
 		Addr:           envList("TRACELENS_CLICKHOUSE_ADDR", []string{"localhost:9000"}),
+		TLS:            envBool("TRACELENS_CLICKHOUSE_TLS", false),
 		Database:       env("TRACELENS_CLICKHOUSE_DB", "tracelens"),
 		Username:       env("TRACELENS_CLICKHOUSE_USER", "default"),
 		Password:       env("TRACELENS_CLICKHOUSE_PASSWORD", ""),

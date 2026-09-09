@@ -78,6 +78,13 @@ func run(log *slog.Logger) error {
 		slog.Int("queue_capacity", cfg.Queue.Capacity),
 		slog.Int("queue_high_water", cfg.Queue.HighWater()),
 		slog.String("backpressure_traces", string(cfg.Queue.PolicyFor(config.SignalTraces))))
+
+	// Readiness tracks the ONE downstream the collector cannot do its job
+	// without: if the broker is unreachable, every accepted span would be
+	// admitted to a bounded queue that can never drain, so this pod should
+	// stop receiving OTLP traffic until it recovers. It is deliberately not
+	// a liveness signal -- see observability.AdminServer's doc comment.
+	admin.SetReadinessCheck(producer.Ping, 0)
 	admin.SetReady(true)
 
 	<-gctx.Done()

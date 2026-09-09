@@ -4,6 +4,7 @@ package storage
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"time"
@@ -20,7 +21,7 @@ import (
 // because migrations must be able to run before that database exists. Every
 // statement in this package is fully qualified for the same reason.
 func Connect(ctx context.Context, cfg config.ClickHouse) (driver.Conn, error) {
-	conn, err := clickhouse.Open(&clickhouse.Options{
+	opts := &clickhouse.Options{
 		Addr: cfg.Addr,
 		Auth: clickhouse.Auth{
 			Database: "default",
@@ -35,7 +36,18 @@ func Connect(ctx context.Context, cfg config.ClickHouse) (driver.Conn, error) {
 			// Reject silently-truncating inserts rather than storing wrong data.
 			"date_time_input_format": "best_effort",
 		},
-	})
+	}
+
+	// An empty tls.Config is deliberate: it means "verify against the
+	// system roots with the default cipher suites". Managed ClickHouse
+	// presents a normal publicly-trusted certificate, so there is nothing
+	// to configure -- and anything more here would mostly be an opportunity
+	// to accidentally disable verification.
+	if cfg.TLS {
+		opts.TLS = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+
+	conn, err := clickhouse.Open(opts)
 	if err != nil {
 		return nil, fmt.Errorf("open clickhouse: %w", err)
 	}

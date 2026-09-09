@@ -140,6 +140,20 @@ func run(log *slog.Logger) error {
 		slog.Int64("buffer_max_bytes", cfg.BufferMaxBytes),
 		slog.String("eviction_policy", string(eviction)),
 		slog.String("decision_wait", cfg.DecisionWait.String()))
+
+	// The assembler needs BOTH downstreams: Kafka to consume from, and
+	// ClickHouse to write decided traces to. Losing either means buffered
+	// traces can only accumulate against the bounded in-flight cap, so the
+	// pod reports unready until both come back.
+	admin.SetReadinessCheck(func(probeCtx context.Context) error {
+		if err := conn.Ping(probeCtx); err != nil {
+			return fmt.Errorf("clickhouse: %w", err)
+		}
+		if err := consumer.Ping(probeCtx); err != nil {
+			return fmt.Errorf("kafka: %w", err)
+		}
+		return nil
+	}, 0)
 	admin.SetReady(true)
 
 	<-gctx.Done()
