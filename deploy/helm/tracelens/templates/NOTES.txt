@@ -1,0 +1,33 @@
+TraceLens {{ .Chart.AppVersion }} installed as {{ .Release.Name }}.
+
+Components:
+{{- if .Values.collector.enabled }}
+  collector   OTLP gRPC :{{ .Values.collector.service.grpcPort }} / HTTP :{{ .Values.collector.service.httpPort }}
+{{- end }}
+{{- if .Values.assembler.enabled }}
+  assembler   {{ .Values.assembler.replicaCount }} replica(s), no Service by design (Kafka consumer)
+{{- end }}
+{{- if .Values.query.enabled }}
+  query       :{{ .Values.query.service.port }}
+{{- end }}
+{{- if .Values.web.enabled }}
+  web         :{{ .Values.web.service.port }}
+{{- end }}
+
+Point an OTLP exporter at:
+  {{ include "tracelens.fullname" . }}-collector.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.collector.service.grpcPort }}
+
+Open the UI locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "tracelens.fullname" . }}-web {{ .Values.web.service.port }}:{{ .Values.web.service.port }}
+
+{{ if gt (int .Values.assembler.replicaCount) (int .Values.kafka.partitions) -}}
+WARNING: assembler.replicaCount ({{ .Values.assembler.replicaCount }}) exceeds
+kafka.partitions ({{ .Values.kafka.partitions }}). Kafka assigns each partition
+to exactly one consumer-group member, so {{ sub (int .Values.assembler.replicaCount) (int .Values.kafka.partitions) }} replica(s) will sit idle
+holding memory and doing nothing.
+{{- end }}
+{{ if not .Values.web.publicAPIBase -}}
+WARNING: web.publicAPIBase is empty. The browser needs a publicly reachable
+query API URL; server-side rendering will work but every client-side fetch
+(the query explorer, log explorer, flamegraph) will fail.
+{{- end }}

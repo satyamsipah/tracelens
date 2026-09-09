@@ -1,0 +1,225 @@
+{{- if .Values.assembler.enabled }}
+# The tail sampler.
+#
+# There is deliberately NO Service resource in this file. The assembler is a
+# Kafka consumer, not a server: the only things it listens on are the admin
+# port (/metrics, /healthz, /readyz), which the kubelet and Prometheus reach
+# directly by pod IP. Fronting it with a Service and pushing spans through
+# would round-robin one trace's spans across replicas and break tail
+# sampling silently -- see values.yaml's header and docs/DECISIONS.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tracelens.fullname" . }}-assembler
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: assembler
+spec:
+  {{- if not .Values.assembler.autoscaling.enabled }}
+  replicas: {{ .Values.assembler.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: assembler
+  strategy:
+    # Recreate-then-start would drop consumption entirely during a deploy;
+    # RollingUpdate with maxSurge 0 keeps at most one partition set moving
+    # at a time, so a rebalance never overlaps another rebalance.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "tracelens.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: assembler
+      annotations:
+        # Roll the pods when the policy/cardinality ConfigMap changes.
+        # Belt and braces: the assembler also hot-reloads policies.yaml on
+        # its own by polling mtime, but a projected ConfigMap update can lag
+        # by up to the kubelet sync period, and cardinality.yaml is only
+        # read at startup.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "tracelens.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Long enough for the in-flight buffer to finish its decisions and for
+      # the writer to drain, so a rolling deploy does not force traces
+      # through the redelivery path unnecessarily. Must exceed
+      # buffer.decisionWait with room for the final ClickHouse write.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: assembler
+          image: {{ include "tracelens.image" (list . "assembler") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: admin
+              containerPort: 9465
+          env:
+            {{- include "tracelens.clickhouseEnv" . | nindent 12 }}
+            {{- include "tracelens.kafkaEnv" . | nindent 12 }}
+            - name: TRACELENS_CONSUMER_GROUP
+              value: {{ .Values.kafka.consumerGroup | quote }}
+            - name: TRACELENS_ADMIN_ADDR
+              value: ":9465"
+            - name: TRACELENS_POLICY_FILE
+              value: /etc/tracelens/policies.yaml
+            - name: TRACELENS_CARDINALITY_FILE
+              value: /etc/tracelens/cardinality.yaml
+            - name: TRACELENS_BUFFER_MAX_TRACES
+              value: {{ .Values.assembler.buffer.maxTraces | quote }}
+            - name: TRACELENS_BUFFER_MAX_BYTES
+              value: {{ .Values.assembler.buffer.maxBytes | quote }}
+            - name: TRACELENS_BUFFER_EVICTION
+              value: {{ .Values.assembler.buffer.eviction | quote }}
+            - name: TRACELENS_DECISION_WAIT
+              value: {{ .Values.assembler.buffer.decisionWait | quote }}
+            - name: TRACELENS_WATERMARK_MAX_AGE
+              value: {{ .Values.assembler.watermark.maxAge | quote }}
+            - name: TRACELENS_WATERMARK_CHECK_INTERVAL
+              value: {{ .Values.assembler.watermark.checkInterval | quote }}
+          # readiness pings BOTH ClickHouse and Kafka (see
+          # internal/observability/admin.go): losing either means buffered
+          # traces can only pile up against the bounded cap.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # Liveness deliberately hits /healthz, which never consults a
+          # downstream: a ClickHouse outage must not kill every assembler
+          # pod and turn one dependency's bad day into a crash-loop.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            # Generous: the first assembler to start also runs the
+            # ClickHouse migrations.
+            failureThreshold: 30
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.assembler.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tracelens
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "tracelens.fullname" . }}-config
+        # readOnlyRootFilesystem is on, so anything needing scratch space
+        # gets an explicit emptyDir rather than a writable root.
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.assembler.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tracelens.fullname" . }}-assembler
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: assembler
+spec:
+  maxUnavailable: {{ .Values.assembler.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: assembler
+{{- end }}
+{{- if .Values.assembler.autoscaling.enabled }}
+---
+# Scales on Kafka consumer lag rather than CPU. The assembler spends most of
+# its time waiting -- on the decision window, on ClickHouse -- so CPU stays
+# flat while the backlog grows; lag is the only signal that means "behind".
+#
+# REQUIRES a metrics adapter serving external.metrics.k8s.io. Neither is
+# installed by this chart:
+#   - prometheus-adapter, mapping tracelens_consumer_lag_seconds, or
+#   - KEDA, whose Kafka scaler reads lag from the broker directly and needs
+#     no Prometheus at all (usually the simpler answer).
+# See deploy/k8s/README.md.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "tracelens.fullname" . }}-assembler
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: assembler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "tracelens.fullname" . }}-assembler
+  minReplicas: {{ .Values.assembler.autoscaling.minReplicas }}
+  # Capped at the partition count: Kafka assigns each partition to exactly
+  # one group member, so replicas beyond that get nothing and just hold
+  # memory.
+  maxReplicas: {{ min .Values.assembler.autoscaling.maxReplicas (int .Values.kafka.partitions) }}
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: {{ .Values.assembler.autoscaling.metricName }}
+          selector:
+            matchLabels:
+              topic: {{ .Values.kafka.topics.spans | quote }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.assembler.autoscaling.lagSecondsTarget | quote }}
+  behavior:
+    scaleUp:
+      # Lag spikes are usually real, so react quickly.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # Every scale-down triggers a consumer-group rebalance that briefly
+      # stops consumption on the moved partitions. Shedding replicas eagerly
+      # after a burst therefore costs throughput exactly when the backlog is
+      # still draining -- hence a deliberately long window and one pod at a
+      # time.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+{{- end }}
+{{- end }}

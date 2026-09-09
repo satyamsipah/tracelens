@@ -1,0 +1,38 @@
+# Caddy fetches and renews Let's Encrypt certificates automatically for the
+# domains below, which is why this file is three blocks and not a page of
+# TLS configuration. Both domains must already resolve to this VPS's public
+# IP before the first start, or the ACME challenge fails.
+
+{$TRACELENS_WEB_DOMAIN} {
+	encode gzip
+	reverse_proxy web:3001
+}
+
+{$TRACELENS_API_DOMAIN} {
+	encode gzip
+
+	# The query API is read-only and unauthenticated by design (see
+	# cmd/query/main.go's CORS comment), but "read-only" is not the same as
+	# "free to hammer": a single expensive DSL query can scan a lot of
+	# ClickHouse. This is a coarse per-IP cap in front of the engine's own
+	# per-query timeout and max-rows-scanned guard, not a replacement for
+	# them.
+	rate_limit {
+		zone api {
+			key {remote_host}
+			events 120
+			window 1m
+		}
+	}
+
+	reverse_proxy query:8080
+}
+
+# Grafana is NOT exposed publicly by default. Reach it over an SSH tunnel:
+#   ssh -N -L 3000:localhost:3000 user@vps
+# and open http://localhost:3000. Uncomment below to publish it instead --
+# and set a real GF_SECURITY_ADMIN_PASSWORD first.
+#
+# grafana.{$TRACELENS_WEB_DOMAIN} {
+# 	reverse_proxy grafana:3000
+# }

@@ -1,0 +1,841 @@
+# GENERATED FILE -- DO NOT EDIT.
+#
+# Rendered from deploy/helm/tracelens by scripts/render-k8s.sh
+# (make k8s-manifests). Edit the chart, not this file.
+#
+# Before applying:
+#   1. Replace REPLACE_ME in the Secret, or delete it and create the
+#      Secret out of band (preferred -- see deploy/k8s/README.md).
+#   2. Set the real public API URL for the web deployment.
+#   3. Point clickhouse/kafka addresses at your actual clusters.
+#
+# kubectl create namespace tracelens
+# kubectl -n tracelens apply -f deploy/k8s/manifests.yaml
+---
+# Source: tracelens/templates/assembler.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tracelens-assembler
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: assembler
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: assembler
+
+---
+# Source: tracelens/templates/collector.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tracelens-collector
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: collector
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: collector
+
+---
+# Source: tracelens/templates/query.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tracelens-query
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: query
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: query
+
+---
+# Source: tracelens/templates/web.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tracelens-web
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: web
+
+---
+# Source: tracelens/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tracelens
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+# No RBAC rules ship with this chart: no TraceLens component talks to the
+# Kubernetes API. Adding a Role would be granting permissions nothing uses.
+automountServiceAccountToken: false
+
+---
+# Source: tracelens/templates/secret.yaml
+# Convenience only, for demos. In production create this Secret out of band
+# (or via an External Secrets operator) and set clickhouse.existingSecret --
+# a password passed through `helm install --set` lands in your shell
+# history and in Helm's release history in-cluster.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tracelens-clickhouse
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+type: Opaque
+stringData:
+  clickhouse-password: "REPLACE_ME"
+
+---
+# Source: tracelens/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tracelens-config
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+data:
+  # Hot-reloaded by the assembler, which polls this file's mtime. An invalid
+  # edit is logged and the PREVIOUS chain stays active -- it never crashes
+  # the assembler or silently disables sampling.
+  #
+  # Order is load-bearing. attribute_match sits AHEAD of rate_limiting so a
+  # debug-flagged trace bypasses the cap entirely rather than being vetoed
+  # by an exhausted bucket, and probabilistic MUST be last: a chain where
+  # nothing matches is treated as a drop, not a silent 100% keep.
+  policies.yaml: |
+    policies:
+      - type: always_sample_errors
+      - type: always_sample_slow
+        mode: threshold
+        threshold: 500ms
+      - type: attribute_match
+        key: debug.force_sample
+        value: "true"
+      - type: rate_limiting
+        rate_per_second: 200
+      - type: probabilistic
+        rate: 0.05
+    
+  cardinality.yaml: |
+    default:
+      budget: 10000
+      action: bucket
+      buckets: 256
+    overrides:
+      - key: http.route
+        budget: 500
+        action: bucket
+        buckets: 128
+      - key: user.id
+        budget: 100000
+        action: drop
+      - key: session.id
+        budget: 100000
+        action: drop
+      - key: customer.email
+        budget: 1000
+        action: drop
+      - key: service.name
+        budget: 50
+        action: keep_and_alert
+    
+  alerts.yaml: |
+    rules: []
+    
+
+---
+# Source: tracelens/templates/collector.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: tracelens-collector
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: collector
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/component: collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      # gRPC multiplexes many calls over one long-lived HTTP/2 connection,
+      # so a plain Service pins a client to whichever replica it first
+      # connected to and load spreads only as clients reconnect. Fine here
+      # (collectors are stateless and clients are many), but it is why a
+      # heavily skewed sender set may want a proper gRPC-aware proxy.
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+    - name: admin
+      port: 9464
+      targetPort: admin
+
+---
+# Source: tracelens/templates/query.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: tracelens-query
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: query
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/component: query
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: admin
+      port: 9466
+      targetPort: admin
+
+---
+# Source: tracelens/templates/web.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: tracelens-web
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/component: web
+  ports:
+    - name: http
+      port: 3001
+      targetPort: http
+
+---
+# Source: tracelens/templates/assembler.yaml
+# The tail sampler.
+#
+# There is deliberately NO Service resource in this file. The assembler is a
+# Kafka consumer, not a server: the only things it listens on are the admin
+# port (/metrics, /healthz, /readyz), which the kubelet and Prometheus reach
+# directly by pod IP. Fronting it with a Service and pushing spans through
+# would round-robin one trace's spans across replicas and break tail
+# sampling silently -- see values.yaml's header and docs/DECISIONS.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracelens-assembler
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: assembler
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: assembler
+  strategy:
+    # Recreate-then-start would drop consumption entirely during a deploy;
+    # RollingUpdate with maxSurge 0 keeps at most one partition set moving
+    # at a time, so a rebalance never overlaps another rebalance.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tracelens
+        app.kubernetes.io/instance: tracelens
+        app.kubernetes.io/component: assembler
+      annotations:
+        # Roll the pods when the policy/cardinality ConfigMap changes.
+        # Belt and braces: the assembler also hot-reloads policies.yaml on
+        # its own by polling mtime, but a projected ConfigMap update can lag
+        # by up to the kubelet sync period, and cardinality.yaml is only
+        # read at startup.
+        checksum/config: 4524ff0b7c2b8dc4aab36dd0ee671dd30196f8cd2db934eb0679a3b5a7f60695
+    spec:
+      serviceAccountName: tracelens
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Long enough for the in-flight buffer to finish its decisions and for
+      # the writer to drain, so a rolling deploy does not force traces
+      # through the redelivery path unnecessarily. Must exceed
+      # buffer.decisionWait with room for the final ClickHouse write.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: assembler
+          image: ghcr.io/satyamsipah/tracelens-assembler:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          ports:
+            - name: admin
+              containerPort: 9465
+          env:
+            - name: TRACELENS_CLICKHOUSE_ADDR
+              value: "clickhouse:9000"
+            - name: TRACELENS_CLICKHOUSE_DB
+              value: "tracelens"
+            - name: TRACELENS_CLICKHOUSE_USER
+              value: "tracelens"
+            - name: TRACELENS_CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tracelens-clickhouse
+                  key: clickhouse-password
+            - name: TRACELENS_KAFKA_BROKERS
+              value: "redpanda:9092"
+            - name: TRACELENS_KAFKA_PARTITIONS
+              value: "12"
+            - name: TRACELENS_TOPIC_SPANS
+              value: "spans"
+            - name: TRACELENS_TOPIC_LOGS
+              value: "logs"
+            - name: TRACELENS_TOPIC_METRICS
+              value: "metrics"
+            - name: TRACELENS_CONSUMER_GROUP
+              value: "tracelens-assembler"
+            - name: TRACELENS_ADMIN_ADDR
+              value: ":9465"
+            - name: TRACELENS_POLICY_FILE
+              value: /etc/tracelens/policies.yaml
+            - name: TRACELENS_CARDINALITY_FILE
+              value: /etc/tracelens/cardinality.yaml
+            - name: TRACELENS_BUFFER_MAX_TRACES
+              value: "50000"
+            - name: TRACELENS_BUFFER_MAX_BYTES
+              value: "2.68435456e+08"
+            - name: TRACELENS_BUFFER_EVICTION
+              value: "forced_decision"
+            - name: TRACELENS_DECISION_WAIT
+              value: "5s"
+            - name: TRACELENS_WATERMARK_MAX_AGE
+              value: "10m"
+            - name: TRACELENS_WATERMARK_CHECK_INTERVAL
+              value: "30s"
+          # readiness pings BOTH ClickHouse and Kafka (see
+          # internal/observability/admin.go): losing either means buffered
+          # traces can only pile up against the bounded cap.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # Liveness deliberately hits /healthz, which never consults a
+          # downstream: a ClickHouse outage must not kill every assembler
+          # pod and turn one dependency's bad day into a crash-loop.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            # Generous: the first assembler to start also runs the
+            # ClickHouse migrations.
+            failureThreshold: 30
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tracelens
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: tracelens-config
+        # readOnlyRootFilesystem is on, so anything needing scratch space
+        # gets an explicit emptyDir rather than a writable root.
+        - name: tmp
+          emptyDir: {}
+
+---
+# Source: tracelens/templates/collector.yaml
+# The OTLP receiver. Stateless and safe behind an ordinary Service: it keys
+# every span by trace_id when producing to Kafka, so which collector replica
+# handled a span has no bearing on which assembler assembles the trace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracelens-collector
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: collector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tracelens
+        app.kubernetes.io/instance: tracelens
+        app.kubernetes.io/component: collector
+    spec:
+      serviceAccountName: tracelens
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # The collector answers OTLP with RESOURCE_EXHAUSTED/429 under
+      # backpressure, so a conforming exporter retries. On shutdown it stops
+      # accepting first and then drains its bounded queue to Kafka; this
+      # grace period is what lets that drain finish instead of dropping
+      # spans the client was already told were accepted.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: collector
+          image: ghcr.io/satyamsipah/tracelens-collector:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: admin
+              containerPort: 9464
+          env:
+            - name: TRACELENS_KAFKA_BROKERS
+              value: "redpanda:9092"
+            - name: TRACELENS_KAFKA_PARTITIONS
+              value: "12"
+            - name: TRACELENS_TOPIC_SPANS
+              value: "spans"
+            - name: TRACELENS_TOPIC_LOGS
+              value: "logs"
+            - name: TRACELENS_TOPIC_METRICS
+              value: "metrics"
+            - name: TRACELENS_OTLP_GRPC_ADDR
+              value: ":4317"
+            - name: TRACELENS_OTLP_HTTP_ADDR
+              value: ":4318"
+            - name: TRACELENS_ADMIN_ADDR
+              value: ":9464"
+            - name: TRACELENS_QUEUE_CAPACITY
+              value: "8192"
+            - name: TRACELENS_BACKPRESSURE_TRACES
+              value: "reject"
+          # readiness pings Kafka: a collector that cannot produce would
+          # only fill a bounded queue that can never drain, so it should
+          # stop receiving OTLP traffic until the broker is back.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+# Source: tracelens/templates/query.yaml
+# The query API. Stateless and freely scalable: every request is answered
+# from ClickHouse, so no replica holds anything another replica needs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracelens-query
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: query
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: query
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tracelens
+        app.kubernetes.io/instance: tracelens
+        app.kubernetes.io/component: query
+      annotations:
+        checksum/config: 4524ff0b7c2b8dc4aab36dd0ee671dd30196f8cd2db934eb0679a3b5a7f60695
+    spec:
+      serviceAccountName: tracelens
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Long enough for the longest query the engine will allow
+      # (query.queryTimeout) to finish rather than be cut off mid-flight.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: query
+          image: ghcr.io/satyamsipah/tracelens-query:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9466
+          env:
+            - name: TRACELENS_CLICKHOUSE_ADDR
+              value: "clickhouse:9000"
+            - name: TRACELENS_CLICKHOUSE_DB
+              value: "tracelens"
+            - name: TRACELENS_CLICKHOUSE_USER
+              value: "tracelens"
+            - name: TRACELENS_CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tracelens-clickhouse
+                  key: clickhouse-password
+            - name: TRACELENS_QUERY_HTTP_ADDR
+              value: ":8080"
+            - name: TRACELENS_ADMIN_ADDR
+              value: ":9466"
+            - name: TRACELENS_QUERY_TIMEOUT
+              value: "30s"
+            # The preflight EXPLAIN-ESTIMATE guard. Without it a single
+            # unbounded DSL query is a self-inflicted denial of service.
+            - name: TRACELENS_QUERY_MAX_ROWS_SCANNED
+              value: "5e+07"
+            - name: TRACELENS_PROMETHEUS_URL
+              value: "http://prometheus:9090"
+            - name: TRACELENS_ALERT_RULES_FILE
+              value: "/etc/tracelens/alerts.yaml"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tracelens
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: tracelens-config
+        - name: tmp
+          emptyDir: {}
+
+---
+# Source: tracelens/templates/web.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracelens-web
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tracelens
+      app.kubernetes.io/instance: tracelens
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tracelens
+        app.kubernetes.io/instance: tracelens
+        app.kubernetes.io/component: web
+    spec:
+      serviceAccountName: tracelens
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: ghcr.io/satyamsipah/tracelens-web:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 3001
+          env:
+            # Docker sets HOSTNAME to the container's own name, and Next.js
+            # standalone binds process.env.HOSTNAME -- without this override
+            # it listens only on the pod IP and the kubelet's probe (which
+            # dials 127.0.0.1 via the pod network) gets connection refused.
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3001"
+            # Server components call the API in-cluster...
+            - name: TRACELENS_API_BASE
+              value: http://tracelens-query:8080
+            # ...while the browser needs a publicly reachable URL. This is
+            # inlined into the client bundle at IMAGE BUILD time, so changing
+            # it requires rebuilding the image, not just redeploying.
+            - name: NEXT_PUBLIC_API_BASE
+              value: "https://api.tracelens.example.com"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            # Next.js writes its build/image cache under .next/cache at
+            # runtime, which readOnlyRootFilesystem otherwise forbids.
+            - name: cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+
+---
+# Source: tracelens/templates/collector.yaml
+# CPU is the right signal here, unlike the assembler: the collector's work
+# is decode-and-forward, so its cost tracks request volume directly.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tracelens-collector
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: collector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tracelens-collector
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# Source: tracelens/templates/query.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tracelens-query
+  labels:
+    helm.sh/chart: tracelens-1.0.0
+    app.kubernetes.io/name: tracelens
+    app.kubernetes.io/instance: tracelens
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: tracelens
+    app.kubernetes.io/component: query
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tracelens-query
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

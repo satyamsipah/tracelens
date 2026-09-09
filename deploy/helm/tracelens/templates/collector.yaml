@@ -1,0 +1,181 @@
+{{- if .Values.collector.enabled }}
+# The OTLP receiver. Stateless and safe behind an ordinary Service: it keys
+# every span by trace_id when producing to Kafka, so which collector replica
+# handled a span has no bearing on which assembler assembles the trace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tracelens.fullname" . }}-collector
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  {{- if not .Values.collector.autoscaling.enabled }}
+  replicas: {{ .Values.collector.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        {{- include "tracelens.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: collector
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "tracelens.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # The collector answers OTLP with RESOURCE_EXHAUSTED/429 under
+      # backpressure, so a conforming exporter retries. On shutdown it stops
+      # accepting first and then drains its bounded queue to Kafka; this
+      # grace period is what lets that drain finish instead of dropping
+      # spans the client was already told were accepted.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: collector
+          image: {{ include "tracelens.image" (list . "collector") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: admin
+              containerPort: 9464
+          env:
+            {{- include "tracelens.kafkaEnv" . | nindent 12 }}
+            - name: TRACELENS_OTLP_GRPC_ADDR
+              value: ":4317"
+            - name: TRACELENS_OTLP_HTTP_ADDR
+              value: ":4318"
+            - name: TRACELENS_ADMIN_ADDR
+              value: ":9464"
+            - name: TRACELENS_QUEUE_CAPACITY
+              value: {{ .Values.collector.queueCapacity | quote }}
+            - name: TRACELENS_BACKPRESSURE_TRACES
+              value: {{ .Values.collector.backpressure | quote }}
+          # readiness pings Kafka: a collector that cannot produce would
+          # only fill a bounded queue that can never drain, so it should
+          # stop receiving OTLP traffic until the broker is back.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tracelens.fullname" . }}-collector
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+  {{- with .Values.collector.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.collector.service.type }}
+  selector:
+    {{- include "tracelens.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+  ports:
+    - name: otlp-grpc
+      port: {{ .Values.collector.service.grpcPort }}
+      targetPort: otlp-grpc
+      # gRPC multiplexes many calls over one long-lived HTTP/2 connection,
+      # so a plain Service pins a client to whichever replica it first
+      # connected to and load spreads only as clients reconnect. Fine here
+      # (collectors are stateless and clients are many), but it is why a
+      # heavily skewed sender set may want a proper gRPC-aware proxy.
+      protocol: TCP
+    - name: otlp-http
+      port: {{ .Values.collector.service.httpPort }}
+      targetPort: otlp-http
+      protocol: TCP
+    - name: admin
+      port: 9464
+      targetPort: admin
+{{- if .Values.collector.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tracelens.fullname" . }}-collector
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  minAvailable: {{ .Values.collector.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: collector
+{{- end }}
+{{- if .Values.collector.autoscaling.enabled }}
+---
+# CPU is the right signal here, unlike the assembler: the collector's work
+# is decode-and-forward, so its cost tracks request volume directly.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "tracelens.fullname" . }}-collector
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "tracelens.fullname" . }}-collector
+  minReplicas: {{ .Values.collector.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.collector.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.collector.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

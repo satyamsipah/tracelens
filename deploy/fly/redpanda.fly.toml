@@ -1,0 +1,48 @@
+# Single-node Redpanda for the live demo.
+#
+# Deliberately internal-only: no [[services]] block, so it is reachable at
+# tracelens-redpanda.internal:9092 over Fly's private WireGuard network and
+# from nowhere else. An internet-exposed broker with no auth would be
+# compromised within hours.
+#
+# ONE node with ONE partition set. That is a real divergence from the
+# architecture this project argues for -- production would want replication
+# and more partitions -- but the property the demo needs to keep intact is
+# trace_id partitioning (all spans of a trace on one partition, therefore
+# one assembler), and that holds at any node count.
+
+app = "tracelens-redpanda"
+primary_region = "iad"
+
+[build]
+  image = "redpandadata/redpanda:v24.2.7"
+
+[experimental]
+  cmd = [
+    "redpanda", "start",
+    "--overprovisioned",
+    "--smp=1",
+    "--memory=700M",
+    "--reserve-memory=0M",
+    "--node-id=0",
+    "--check=false",
+    "--kafka-addr=PLAINTEXT://0.0.0.0:9092",
+    # Must advertise the .internal name, not 0.0.0.0: clients resolve the
+    # advertised address after the initial metadata exchange, so advertising
+    # a bind address makes every produce/fetch fail after connecting.
+    "--advertise-kafka-addr=PLAINTEXT://tracelens-redpanda.internal:9092",
+  ]
+
+[mounts]
+  source = "redpanda_data"
+  destination = "/var/lib/redpanda/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+# No auto-stop: a broker that scales to zero loses its consumer-group
+# coordinator, and the assembler reconnects into a reset it then has to
+# recover from (see docs/DECISIONS.md phase 5).
+[[restart]]
+  policy = "always"

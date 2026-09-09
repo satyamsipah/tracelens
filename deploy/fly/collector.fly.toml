@@ -1,0 +1,60 @@
+# OTLP receiver. The only publicly reachable ingest surface.
+
+app = "tracelens-collector"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/satyamsipah/tracelens-collector:v1.0.0"
+
+[env]
+  TRACELENS_KAFKA_BROKERS = "tracelens-redpanda.internal:9092"
+  TRACELENS_OTLP_GRPC_ADDR = ":4317"
+  TRACELENS_OTLP_HTTP_ADDR = ":4318"
+  TRACELENS_ADMIN_ADDR = ":9464"
+  TRACELENS_QUEUE_CAPACITY = "8192"
+  TRACELENS_BACKPRESSURE_TRACES = "reject"
+
+# OTLP gRPC. A raw TCP service with a TLS handler, NOT [http_service]:
+# OTLP gRPC is HTTP/2 with long-lived streams, and Fly's HTTP service does
+# not proxy it correctly. This is the main reason the deployment target here
+# is Fly rather than a platform that only speaks HTTP.
+[[services]]
+  internal_port = 4317
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 4317
+    handlers = ["tls"]
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+
+# OTLP HTTP, for exporters that cannot do gRPC.
+[[services]]
+  internal_port = 4318
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "2s"
+    method = "get"
+    # Readiness pings Kafka, so this check pulls the machine out of
+    # rotation if the broker is unreachable rather than accepting spans
+    # into a queue that can never drain.
+    path = "/readyz"
+    port = 9464
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

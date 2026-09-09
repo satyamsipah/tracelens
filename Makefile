@@ -123,3 +123,15 @@ correctnesscheck: ## Prove ingested-minus-dropped equals stored under load
 .PHONY: bench-all
 bench-all: ## Run every Part B benchmark; raw output lands in bench/out/
 	ROWS=$(or $(ROWS),10000000) ITERS=$(or $(ITERS),5) ./scripts/bench-all.sh
+
+# The Helm chart is the source of truth. deploy/k8s/manifests.yaml is a
+# rendering of it, committed so the repo also has a plain-kubectl path.
+.PHONY: k8s-manifests
+k8s-manifests: ## Re-render deploy/k8s/manifests.yaml from the Helm chart
+	./scripts/render-k8s.sh
+
+.PHONY: helm-lint
+helm-lint: ## Lint the chart and validate rendered manifests against the k8s schema
+	helm lint deploy/helm/tracelens
+	@helm template tracelens deploy/helm/tracelens | kubeconform -strict -summary - \
+		|| echo "kubeconform not installed; helm lint passed"

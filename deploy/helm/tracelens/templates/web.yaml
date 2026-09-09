@@ -1,0 +1,121 @@
+{{- if .Values.web.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tracelens.fullname" . }}-web
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        {{- include "tracelens.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "tracelens.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: web
+          image: {{ include "tracelens.image" (list . "web") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3001
+          env:
+            # Docker sets HOSTNAME to the container's own name, and Next.js
+            # standalone binds process.env.HOSTNAME -- without this override
+            # it listens only on the pod IP and the kubelet's probe (which
+            # dials 127.0.0.1 via the pod network) gets connection refused.
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3001"
+            # Server components call the API in-cluster...
+            - name: TRACELENS_API_BASE
+              value: http://{{ include "tracelens.fullname" . }}-query:{{ .Values.query.service.port }}
+            # ...while the browser needs a publicly reachable URL. This is
+            # inlined into the client bundle at IMAGE BUILD time, so changing
+            # it requires rebuilding the image, not just redeploying.
+            - name: NEXT_PUBLIC_API_BASE
+              value: {{ .Values.web.publicAPIBase | quote }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          volumeMounts:
+            # Next.js writes its build/image cache under .next/cache at
+            # runtime, which readOnlyRootFilesystem otherwise forbids.
+            - name: cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tracelens.fullname" . }}-web
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: {{ .Values.web.service.type }}
+  selector:
+    {{- include "tracelens.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http
+{{- if .Values.web.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tracelens.fullname" . }}-web
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  minAvailable: {{ .Values.web.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+{{- end }}
+{{- end }}

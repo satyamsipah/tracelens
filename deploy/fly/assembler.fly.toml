@@ -1,0 +1,45 @@
+# Trace assembler and tail sampler.
+#
+# NO [[services]] block, deliberately. The assembler is a Kafka consumer,
+# not a server -- nothing should ever send it spans over the network. A
+# load balancer in front of it would round-robin one trace's spans across
+# machines and break tail sampling silently (see deploy/k8s/README.md for
+# what exactly breaks). Its only listener is the admin port, reachable on
+# the private network at tracelens-assembler.internal:9465.
+#
+# ONE machine. Scaling this requires as many Kafka partitions as machines,
+# and the demo broker runs a small fixed partition count.
+
+app = "tracelens-assembler"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/satyamsipah/tracelens-assembler:v1.0.0"
+
+[env]
+  TRACELENS_KAFKA_BROKERS = "tracelens-redpanda.internal:9092"
+  TRACELENS_ADMIN_ADDR = ":9465"
+  TRACELENS_POLICY_FILE = "/etc/tracelens/policies.yaml"
+  TRACELENS_CARDINALITY_FILE = "/etc/tracelens/cardinality.yaml"
+  # ClickHouse Cloud speaks the native protocol on 9440 with TLS.
+  TRACELENS_CLICKHOUSE_TLS = "true"
+  # Sized for a 512MB machine: the buffer's byte cap must leave room for
+  # the decoder, the writer queue, and Go's heap slack.
+  TRACELENS_BUFFER_MAX_TRACES = "20000"
+  TRACELENS_BUFFER_MAX_BYTES = "134217728"
+  TRACELENS_BUFFER_EVICTION = "forced_decision"
+
+# Set as secrets, never in this file:
+#   fly secrets set -a tracelens-assembler \
+#     TRACELENS_CLICKHOUSE_ADDR=xxx.clickhouse.cloud:9440 \
+#     TRACELENS_CLICKHOUSE_USER=default \
+#     TRACELENS_CLICKHOUSE_PASSWORD=...
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Never scale to zero: a stopped assembler stops consuming, and the backlog
+# it returns to has to be reprocessed before anything recent is queryable.
+[[restart]]
+  policy = "always"

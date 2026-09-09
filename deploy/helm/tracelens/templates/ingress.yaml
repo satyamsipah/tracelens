@@ -1,0 +1,47 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "tracelens.fullname" . }}
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.webHost | quote }}
+        - {{ .Values.ingress.apiHost | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.webHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "tracelens.fullname" . }}-web
+                port:
+                  number: {{ .Values.web.service.port }}
+    - host: {{ .Values.ingress.apiHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "tracelens.fullname" . }}-query
+                port:
+                  number: {{ .Values.query.service.port }}
+# NOTE: OTLP ingest is deliberately absent from this Ingress. OTLP gRPC is
+# HTTP/2 over a long-lived connection and most ingress controllers need
+# per-controller annotations to proxy it correctly; exposing the collector
+# is better done with a dedicated Service of type LoadBalancer (set
+# collector.service.type) than by fighting an HTTP ingress into doing gRPC.
+{{- end }}

@@ -1,0 +1,34 @@
+apiVersion: v2
+name: tracelens
+description: |
+  OpenTelemetry-compatible observability platform: OTLP ingestion,
+  tail-based sampling with bounded memory, columnar storage with hand-tuned
+  codecs, Drain log templating, and a hand-written query planner.
+type: application
+
+# version is the CHART version; appVersion is the TraceLens release the
+# chart's default image tag points at. They move independently -- a chart
+# fix (a probe threshold, say) bumps version alone.
+version: 1.0.0
+appVersion: "1.0.0"
+
+home: https://github.com/satyamsipah/tracelens
+sources:
+  - https://github.com/satyamsipah/tracelens
+keywords:
+  - observability
+  - opentelemetry
+  - distributed-tracing
+  - tail-sampling
+  - clickhouse
+maintainers:
+  - name: satyamsipah
+    url: https://github.com/satyamsipah
+
+# ClickHouse and Redpanda are deliberately NOT subcharts. Both are stateful
+# systems whose production operation (replication, backups, upgrades,
+# storage classes) deserves a purpose-built operator or a managed service,
+# not a transitively-owned dependency of an application chart. Point
+# values.clickhouse.* and values.redpanda.* at existing clusters instead;
+# deploy/k8s/dependencies-dev.yaml has throwaway single-node ones for
+# kicking the tyres.

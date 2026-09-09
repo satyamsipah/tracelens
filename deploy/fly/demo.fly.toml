@@ -1,0 +1,54 @@
+# The demo microservice app: four instrumented services in one image,
+# selected by the -service flag, generating traffic continuously.
+#
+# This is what makes the public demo show live traces instead of an empty
+# screen. The gateway self-drives at DEMO_DRIVE_RPS, calling checkout ->
+# inventory -> payments, so the service map, flamegraph, and RED metrics all
+# have real data without anyone touching anything.
+#
+# Fly process groups run all four from one image. They share a machine size
+# because none of them does real work -- the latency and error rates are
+# injected, not earned.
+
+app = "tracelens-demo"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/satyamsipah/tracelens-demo:v1.0.0"
+
+[env]
+  OTEL_EXPORTER_OTLP_ENDPOINT = "http://tracelens-collector.internal:4317"
+  OTEL_EXPORTER_OTLP_INSECURE = "true"
+
+[processes]
+  gateway = "-service gateway"
+  checkout = "-service checkout"
+  inventory = "-service inventory"
+  payments = "-service payments"
+
+# Only the gateway self-drives; the others answer its calls.
+[env.gateway]
+  DEMO_DRIVE_RPS = "3"
+  DEMO_LATENCY_MS = "8"
+  DEMO_JITTER_MS = "20"
+  DEMO_ERROR_RATE = "0.01"
+
+[env.checkout]
+  DEMO_LATENCY_MS = "15"
+  DEMO_JITTER_MS = "40"
+  DEMO_ERROR_RATE = "0.03"
+
+[env.inventory]
+  DEMO_LATENCY_MS = "25"
+  DEMO_JITTER_MS = "60"
+  DEMO_ERROR_RATE = "0.05"
+
+[env.payments]
+  DEMO_LATENCY_MS = "40"
+  DEMO_JITTER_MS = "80"
+  DEMO_ERROR_RATE = "0.02"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["gateway", "checkout", "inventory", "payments"]

@@ -1,0 +1,46 @@
+{{- if .Values.serviceMonitor.enabled }}
+# Requires the Prometheus Operator CRDs. Off by default so `helm install`
+# does not fail on a cluster without them.
+{{- range $component := list "collector" "query" }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "tracelens.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "tracelens.labels" $ | nindent 4 }}
+    {{- with $.Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: {{ $.Values.serviceMonitor.interval }}
+{{- end }}
+---
+# The assembler has no Service (by design -- see values.yaml), so its
+# metrics are scraped by pod rather than through one.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "tracelens.fullname" . }}-assembler
+  labels:
+    {{- include "tracelens.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tracelens.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: assembler
+  podMetricsEndpoints:
+    - port: admin
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

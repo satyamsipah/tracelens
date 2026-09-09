@@ -1,0 +1,372 @@
+# Single-VPS production deployment.
+#
+# Differences from docker-compose.yml (the dev/demo stack) that matter:
+#
+#   - Pulls published images instead of building. Set TRACELENS_IMAGE_TAG to
+#     pin a release; `latest` is deliberately NOT the default, because a
+#     restart silently picking up a new build is exactly how a "nothing
+#     changed" outage happens.
+#   - No secrets in this file. Every credential comes from .env (see
+#     deploy/env.prod.example) and uses the ${VAR:?message} form, so compose
+#     refuses to start rather than falling back to a dev password.
+#   - Explicit memory limits on every service. The tail sampler's buffer is
+#     already bounded in-process (CLAUDE.md principle 2); this is the second
+#     line of defence for everything else sharing one box.
+#   - Restart policies, log rotation, and named volumes for state.
+#   - The demo services are behind a `demo` profile, off by default:
+#     `docker compose --profile demo up -d` to include them.
+#
+# Usage:
+#   cp deploy/env.prod.example .env && $EDITOR .env
+#   docker compose -f deploy/docker-compose.prod.yml up -d
+#
+# This file assumes ONE assembler replica. Scaling it needs the trace_id
+# affinity rules in deploy/k8s/README.md -- read that before adding replicas.
+
+name: tracelens
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: tracelens-clickhouse
+    <<: [*default-restart]
+    logging: *default-logging
+    environment:
+      CLICKHOUSE_USER: ${TRACELENS_CLICKHOUSE_USER:?set TRACELENS_CLICKHOUSE_USER in .env}
+      CLICKHOUSE_PASSWORD: ${TRACELENS_CLICKHOUSE_PASSWORD:?set TRACELENS_CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/config.d/storage.xml:/etc/clickhouse-server/config.d/storage.xml:ro
+    # Not published to the host: only the compose network needs it. Exposing
+    # 8123/9000 on a public VPS is how a ClickHouse ends up mining crypto.
+    expose:
+      - "8123"
+      - "9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_CLICKHOUSE_MEM:-4g}
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: tracelens-redpanda
+    <<: [*default-restart]
+    logging: *default-logging
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=${TRACELENS_REDPANDA_MEM:-1G}
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    expose:
+      - "9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_REDPANDA_MEM_LIMIT:-1500m}
+
+  collector:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-collector:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env, e.g. v1.0.0}
+    container_name: tracelens-collector
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      redpanda: { condition: service_healthy }
+    environment:
+      TRACELENS_KAFKA_BROKERS: redpanda:9092
+      TRACELENS_OTLP_GRPC_ADDR: ":4317"
+      TRACELENS_OTLP_HTTP_ADDR: ":4318"
+      TRACELENS_ADMIN_ADDR: ":9464"
+      TRACELENS_QUEUE_CAPACITY: ${TRACELENS_QUEUE_CAPACITY:-8192}
+      TRACELENS_LOG_LEVEL: ${TRACELENS_LOG_LEVEL:-info}
+    ports:
+      - "${TRACELENS_OTLP_GRPC_PORT:-4317}:4317"
+      - "${TRACELENS_OTLP_HTTP_PORT:-4318}:4318"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9464/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_COLLECTOR_MEM:-512m}
+
+  assembler:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-assembler:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-assembler
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+    environment:
+      TRACELENS_KAFKA_BROKERS: redpanda:9092
+      TRACELENS_CLICKHOUSE_ADDR: clickhouse:9000
+      TRACELENS_CLICKHOUSE_USER: ${TRACELENS_CLICKHOUSE_USER}
+      TRACELENS_CLICKHOUSE_PASSWORD: ${TRACELENS_CLICKHOUSE_PASSWORD}
+      TRACELENS_ADMIN_ADDR: ":9465"
+      TRACELENS_POLICY_FILE: /etc/tracelens/policies.yaml
+      TRACELENS_CARDINALITY_FILE: /etc/tracelens/cardinality.yaml
+      # Sized for a single VPS. The buffer's byte cap is the one that
+      # actually binds under real trace shapes -- see docs/BENCHMARKS.md's
+      # measured 98 bytes/trace floor.
+      TRACELENS_BUFFER_MAX_TRACES: ${TRACELENS_BUFFER_MAX_TRACES:-50000}
+      TRACELENS_BUFFER_MAX_BYTES: ${TRACELENS_BUFFER_MAX_BYTES:-268435456}
+      TRACELENS_BUFFER_EVICTION: forced_decision
+      TRACELENS_LOG_LEVEL: ${TRACELENS_LOG_LEVEL:-info}
+    volumes:
+      - ./tracelens/policies.yaml:/etc/tracelens/policies.yaml:ro
+      - ./tracelens/cardinality.yaml:/etc/tracelens/cardinality.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9465/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # Must exceed TRACELENS_BUFFER_MAX_BYTES with headroom for the
+          # decoder, the writer queue, and Go's own heap slack.
+          memory: ${TRACELENS_ASSEMBLER_MEM:-1g}
+
+  query:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-query:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-query
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    environment:
+      TRACELENS_CLICKHOUSE_ADDR: clickhouse:9000
+      TRACELENS_CLICKHOUSE_USER: ${TRACELENS_CLICKHOUSE_USER}
+      TRACELENS_CLICKHOUSE_PASSWORD: ${TRACELENS_CLICKHOUSE_PASSWORD}
+      TRACELENS_QUERY_HTTP_ADDR: ":8080"
+      TRACELENS_ADMIN_ADDR: ":9466"
+      TRACELENS_ALERT_RULES_FILE: /etc/tracelens/alerts.yaml
+      TRACELENS_PROMETHEUS_URL: http://prometheus:9090
+      TRACELENS_QUERY_MAX_ROWS_SCANNED: ${TRACELENS_QUERY_MAX_ROWS_SCANNED:-50000000}
+      TRACELENS_LOG_LEVEL: ${TRACELENS_LOG_LEVEL:-info}
+    volumes:
+      - ./tracelens/alerts.yaml:/etc/tracelens/alerts.yaml:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9466/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_QUERY_MEM:-512m}
+
+  web:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-web:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-web
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      query: { condition: service_healthy }
+    environment:
+      # Server components reach the API over the compose network; the
+      # browser reaches it through the public URL. Two different addresses
+      # for the same service, which is why these are two variables.
+      TRACELENS_API_BASE: http://query:8080
+      NEXT_PUBLIC_API_BASE: ${TRACELENS_PUBLIC_API_URL:?set TRACELENS_PUBLIC_API_URL in .env, e.g. https://api.example.com}
+    expose:
+      - "3001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3001/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_WEB_MEM:-512m}
+
+  # Caddy terminates TLS and is the ONLY service publishing 80/443. It gets
+  # certificates automatically from Let's Encrypt for the domains in
+  # deploy/caddy/Caddyfile, which is the least-effort correct answer for a
+  # single VPS (no cert renewal cron, no manual nginx TLS config).
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: tracelens-caddy
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      query: { condition: service_healthy }
+      web: { condition: service_healthy }
+    environment:
+      TRACELENS_WEB_DOMAIN: ${TRACELENS_WEB_DOMAIN:?set TRACELENS_WEB_DOMAIN in .env}
+      TRACELENS_API_DOMAIN: ${TRACELENS_API_DOMAIN:?set TRACELENS_API_DOMAIN in .env}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: tracelens-prometheus
+    <<: [*default-restart]
+    logging: *default-logging
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    expose:
+      - "9090"
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_PROMETHEUS_MEM:-512m}
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: tracelens-grafana
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      prometheus: { condition: service_started }
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${TRACELENS_GRAFANA_PASSWORD:?set TRACELENS_GRAFANA_PASSWORD in .env}
+      # Anonymous access is OFF here, unlike the dev stack: this one is
+      # reachable from the internet.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      GF_SERVER_ROOT_URL: ${TRACELENS_GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    expose:
+      - "3000"
+    deploy:
+      resources:
+        limits:
+          memory: ${TRACELENS_GRAFANA_MEM:-512m}
+
+  # ------------------------------------------------------------ demo --
+  # Off by default. `--profile demo` turns these on to generate continuous
+  # traffic, which is what makes a public demo show live traces instead of
+  # an empty screen.
+  gateway:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-demo:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-gateway
+    profiles: ["demo"]
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      collector: { condition: service_healthy }
+    command: ["-service", "gateway"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      DEMO_LATENCY_MS: "8"
+      DEMO_JITTER_MS: "20"
+      DEMO_ERROR_RATE: "0.01"
+      DEMO_DRIVE_RPS: ${TRACELENS_DEMO_RPS:-5}
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  checkout:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-demo:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-checkout
+    profiles: ["demo"]
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      collector: { condition: service_healthy }
+    command: ["-service", "checkout"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      DEMO_LATENCY_MS: "15"
+      DEMO_JITTER_MS: "40"
+      DEMO_ERROR_RATE: "0.03"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  inventory:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-demo:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-inventory
+    profiles: ["demo"]
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      collector: { condition: service_healthy }
+    command: ["-service", "inventory"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      DEMO_LATENCY_MS: "25"
+      DEMO_JITTER_MS: "60"
+      DEMO_ERROR_RATE: "0.05"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  payments:
+    image: ghcr.io/${TRACELENS_IMAGE_REPO:-satyamsipah/tracelens}-demo:${TRACELENS_IMAGE_TAG:?set TRACELENS_IMAGE_TAG in .env}
+    container_name: tracelens-payments
+    profiles: ["demo"]
+    <<: [*default-restart]
+    logging: *default-logging
+    depends_on:
+      collector: { condition: service_healthy }
+    command: ["-service", "payments"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+      DEMO_LATENCY_MS: "40"
+      DEMO_JITTER_MS: "80"
+      DEMO_ERROR_RATE: "0.02"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+volumes:
+  clickhouse-data:
+  redpanda-data:
+  prometheus-data:
+  grafana-data:
+  caddy-data:
+  caddy-config:

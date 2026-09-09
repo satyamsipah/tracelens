@@ -1,0 +1,276 @@
+# Default values for TraceLens.
+#
+# READ THIS FIRST IF YOU ARE SCALING THE ASSEMBLER
+# ------------------------------------------------
+# The assembler is the tail sampler. It buffers every span of a trace in
+# local memory until that trace's sampling decision fires, which only works
+# because all spans of one trace reach the SAME replica.
+#
+# That affinity comes from Kafka partitioning by trace_id, NOT from anything
+# Kubernetes does. Two consequences, both load-bearing:
+#
+#   1. The assembler has NO Service in this chart, on purpose. It is a
+#      Kafka consumer, not a server -- nothing should ever send it spans
+#      over the network. Putting a Service (or any load balancer) in front
+#      of it and pushing spans through would round-robin a single trace's
+#      spans across replicas, and each replica would then decide on a
+#      fragment: the instance that never saw the ERROR span drops a failing
+#      trace, invisibly, and every fragment carries its own sampling weight
+#      so aggregates double-count. See docs/DECISIONS.md, phase 1 sec 2.
+#   2. assembler.replicaCount must never exceed kafka.partitions. Kafka
+#      gives each partition to exactly one consumer-group member, so extra
+#      replicas beyond the partition count sit idle holding memory.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: ghcr.io
+  repository: satyamsipah/tracelens
+  # Pinned per component below as <repository>-<component>:<tag>.
+  # Empty tag falls back to .Chart.AppVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# ---------------------------------------------------------------- storage --
+# Point these at an existing ClickHouse. The chart does not run one: see
+# Chart.yaml's note on why stateful dependencies are not subcharts here.
+clickhouse:
+  addr: clickhouse:9000
+  database: tracelens
+  user: tracelens
+  # Never set the password here. It is read from the Secret below, which
+  # you either create yourself or let the chart create from
+  # secrets.clickhousePassword (fine for a demo, not for production --
+  # prefer an external secret manager and secrets.create=false).
+  existingSecret: ""
+  existingSecretPasswordKey: clickhouse-password
+
+kafka:
+  brokers: redpanda:9092
+  # Fixed at deploy time, not a knob to turn casually: Kafka's partitioner
+  # is hash(key) % N, so changing N rehashes every trace_id and splits any
+  # trace in flight across the change. Growing this is a planned migration.
+  partitions: 12
+  consumerGroup: tracelens-assembler
+  topics:
+    spans: spans
+    logs: logs
+    metrics: metrics
+
+secrets:
+  # When true the chart creates a Secret from the values below. Intended for
+  # demos; in production create the Secret out of band and set
+  # clickhouse.existingSecret instead.
+  create: true
+  clickhousePassword: ""
+
+# -------------------------------------------------------------- collector --
+collector:
+  enabled: true
+  replicaCount: 2
+  # Safe to scale freely and to sit behind an ordinary Service: the
+  # collector is stateless. It keys each span by trace_id when producing to
+  # Kafka, so which collector replica handled a span has no bearing on
+  # which assembler assembles it.
+  service:
+    type: ClusterIP
+    grpcPort: 4317
+    httpPort: 4318
+    annotations: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  queueCapacity: 8192
+  backpressure: reject
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+# -------------------------------------------------------------- assembler --
+assembler:
+  enabled: true
+  # See the affinity note at the top of this file before changing.
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 500m
+      # Requests must comfortably exceed bufferMaxBytes: the request is what
+      # the scheduler reserves, and a pod that gets scheduled onto a node
+      # without room for its own bounded buffer will OOM under load rather
+      # than at startup, which is much harder to diagnose.
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  buffer:
+    maxTraces: 50000
+    maxBytes: 268435456 # 256Mi
+    eviction: forced_decision # or: discard
+    decisionWait: 5s
+  watermark:
+    maxAge: 10m
+    checkInterval: 30s
+  autoscaling:
+    # Scales on Kafka consumer lag, not CPU: the assembler's cost is
+    # dominated by waiting on decisions and ClickHouse writes, so CPU stays
+    # low while lag grows. Lag is the signal that actually means "behind".
+    #
+    # This HPA reads an EXTERNAL metric, which requires a metrics adapter
+    # that exposes it (prometheus-adapter mapping the
+    # tracelens_consumer_lag_seconds gauge, or KEDA, which ships a Kafka
+    # scaler and needs no Prometheus at all). Neither is installed by this
+    # chart -- see deploy/k8s/README.md for both paths.
+    enabled: false
+    minReplicas: 2
+    # Never above kafka.partitions: extra replicas get no partitions.
+    maxReplicas: 12
+    lagSecondsTarget: 30
+    metricName: tracelens_consumer_lag_seconds
+  podDisruptionBudget:
+    enabled: true
+    # maxUnavailable, not minAvailable: every eviction triggers a Kafka
+    # consumer-group rebalance that briefly stops consumption on the moved
+    # partitions, so evictions should happen strictly one at a time.
+    maxUnavailable: 1
+
+# ------------------------------------------------------------------ query --
+query:
+  enabled: true
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    port: 8080
+    annotations: {}
+  resources:
+    requests:
+      cpu: 200m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  queryTimeout: 30s
+  maxRowsScanned: 50000000
+  prometheusURL: http://prometheus:9090
+  alertRulesFile: /etc/tracelens/alerts.yaml
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+# -------------------------------------------------------------------- web --
+web:
+  enabled: true
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    port: 3001
+  # What the BROWSER uses to reach the query API. Baked into the Next.js
+  # client bundle at image build time, so changing it needs a rebuild, not
+  # just a redeploy.
+  publicAPIBase: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+# -------------------------------------------------------------- ingress ---
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  webHost: tracelens.example.com
+  apiHost: api.tracelens.example.com
+  tls:
+    enabled: true
+    secretName: tracelens-tls
+
+# ------------------------------------------------------------ policy files --
+# Mounted into the assembler as a ConfigMap and hot-reloaded on change (the
+# assembler polls the file's mtime). A malformed edit is logged and the
+# PREVIOUS chain stays active -- it never crashes the assembler or silently
+# disables sampling.
+policies: |
+  policies:
+    - type: always_sample_errors
+    - type: always_sample_slow
+      mode: threshold
+      threshold: 500ms
+    - type: attribute_match
+      key: debug.force_sample
+      value: "true"
+    - type: rate_limiting
+      rate_per_second: 200
+    - type: probabilistic
+      rate: 0.05
+
+cardinality: |
+  default:
+    budget: 10000
+    action: bucket
+    buckets: 256
+  overrides:
+    - key: http.route
+      budget: 500
+      action: bucket
+      buckets: 128
+    - key: user.id
+      budget: 100000
+      action: drop
+    - key: session.id
+      budget: 100000
+      action: drop
+    - key: customer.email
+      budget: 1000
+      action: drop
+    - key: service.name
+      budget: 50
+      action: keep_and_alert
+
+alerts: |
+  rules: []
+
+# --------------------------------------------------------------- common ---
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+serviceMonitor:
+  # Prometheus Operator ServiceMonitor for the admin ports. Off by default
+  # since it requires the CRD to exist.
+  enabled: false
+  interval: 15s
+  labels: {}
