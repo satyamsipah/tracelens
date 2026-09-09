@@ -11,6 +11,11 @@ import type { SpanRow } from "@/lib/types";
 
 const SAMPLE_TRACES = 20;
 
+// The previous suggestion ("charge") is not an operation the demo
+// workload emits, so the hint a new visitor types first produced an
+// empty flamegraph on a fresh stack.
+const OPERATION_PLACEHOLDER = 'operation name, e.g. "HTTP GET"';
+
 export default function FlamegraphPage() {
   const [operations, setOperations] = useState<string[]>([]);
   const [operation, setOperation] = useState("");
@@ -68,7 +73,7 @@ export default function FlamegraphPage() {
           list="operations"
           value={operation}
           onChange={(e) => setOperation(e.target.value)}
-          placeholder="operation name, e.g. charge"
+          placeholder={OPERATION_PLACEHOLDER}
           className="max-w-xs"
         />
         <datalist id="operations">

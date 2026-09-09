@@ -9,10 +9,16 @@ import { ResultView } from "@/components/result-view";
 import { explainQuery, fetchServices, runQuery } from "@/lib/api";
 import type { ExplainResult, QueryResult } from "@/lib/types";
 
+// Tuned to return rows against the workload deploy/docker-compose.yml
+// actually generates. The previous first example filtered `duration > 500ms`
+// while the demo's slowest span is ~250ms, and the third was a hard-coded
+// zero trace id -- so the two things a new visitor clicks first both returned
+// nothing. An example that returns no rows teaches the reader that the tool
+// is broken, not that the filter is selective.
 const EXAMPLES = [
-  '{service="checkout", status=error} | duration > 500ms | count by (operation)',
+  '{service="checkout", status=error} | duration > 100ms | count by (operation)',
   '{} | p50(duration), p95(duration), p99(duration) by (operation) | sort by (p99_duration desc) | limit 10',
-  'trace("00000000000000000000000000000001")',
+  '{status=error} | sort by (duration desc) | limit 20',
 ];
 
 export default function QueryExplorerPage() {
@@ -64,7 +70,7 @@ export default function QueryExplorerPage() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Query explorer</h1>
         <p className="text-sm text-muted-foreground">
-          {"{service=\"x\", status=error} | duration > 500ms | count by (operation)"} -- Ctrl/Cmd+Enter to run.
+          {"{service=\"x\", status=error} | duration > 100ms | count by (operation)"} -- Ctrl/Cmd+Enter to run.
         </p>
       </div>
 

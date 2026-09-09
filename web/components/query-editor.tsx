@@ -99,7 +99,7 @@ export function QueryEditor({ value, onChange, onSubmit, services, operations }:
           ]),
           dslLanguage,
           autocompletion({ override: [completionSource] }),
-          cmPlaceholder('{service="checkout", status=error} | duration > 500ms | count by (operation)'),
+          cmPlaceholder('{service="checkout", status=error} | duration > 100ms | count by (operation)'),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) onChange(update.state.doc.toString());
           }),
