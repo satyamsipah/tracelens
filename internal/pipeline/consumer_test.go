@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -191,7 +193,7 @@ func TestConsumerCommitGateWithholdsAndReleases(t *testing.T) {
 				return -1, true // hold everything back on every partition
 			}
 			return 0, false // no ceiling: commit whatever this poll saw
-		})
+		}, nil)
 	}()
 
 	// Give it time to poll and attempt (and withhold) a commit.
@@ -242,4 +244,59 @@ func fetchCommittedOffset(t *testing.T, ctx context.Context, cfg config.Kafka) i
 		}
 	})
 	return max
+}
+
+// TestClassifyFetchError exercises RunWithCommitGate's exact error-handling
+// function directly, against hand-constructed error values, rather than
+// through a live broker. A live reproduction of a genuine franz-go
+// kgo.ErrDataLoss was attempted first (delete and recreate a topic under a
+// consumer group with a stale committed offset -- the same client-visible
+// shape as a broker losing its data) and did NOT reliably reproduce it: a
+// fresh consumer joining from a stale committed offset just gets a plain,
+// silent reset with no error at all. Investigating why led to a real
+// finding, not a shrug: kgo.ErrDataLoss is franz-go's KIP-320 log-
+// truncation detection, which requires an established leader EPOCH the
+// client already holds from an ACTIVELY LIVE session -- a committed offset
+// fetched fresh via OffsetFetch carries no epoch (defaults to -1, "no
+// truncation detection"), so a first-time join can never trigger it,
+// regardless of how stale the offset is. Reliably reproducing the live-
+// session variant would need a client kept continuously connected while
+// the broker's data disappears out from under it mid-poll -- meaningfully
+// more complex to construct deterministically than this bug fix warranted
+// blocking on. This test instead proves the exact function
+// RunWithCommitGate calls handles a real *kgo.ErrDataLoss value correctly.
+func TestClassifyFetchError(t *testing.T) {
+	t.Run("should treat our own poll-timeout wakeup as not a real error", func(t *testing.T) {
+		real, dataLoss := classifyFetchError(kgo.FetchError{Err: context.DeadlineExceeded})
+		require.False(t, real)
+		require.Nil(t, dataLoss)
+	})
+
+	t.Run("should treat a generic fetch error as real but not data loss", func(t *testing.T) {
+		real, dataLoss := classifyFetchError(kgo.FetchError{Topic: "spans", Partition: 2, Err: errors.New("boom")})
+		require.True(t, real)
+		require.Nil(t, dataLoss)
+	})
+
+	t.Run("should extract kgo.ErrDataLoss's exact fields when present", func(t *testing.T) {
+		original := &kgo.ErrDataLoss{Topic: "spans", Partition: 3, ConsumedTo: 13301, ResetTo: 0}
+		real, dataLoss := classifyFetchError(kgo.FetchError{Topic: "spans", Partition: 3, Err: original})
+
+		require.True(t, real)
+		require.NotNil(t, dataLoss)
+		require.Equal(t, "spans", dataLoss.Topic)
+		require.Equal(t, int32(3), dataLoss.Partition)
+		require.Equal(t, int64(0), dataLoss.ResetTo)
+		require.Equal(t, int64(13301), dataLoss.ConsumedTo)
+	})
+
+	t.Run("should unwrap kgo.ErrDataLoss even when wrapped by another error", func(t *testing.T) {
+		wrapped := fmt.Errorf("fetch failed: %w", &kgo.ErrDataLoss{Topic: "spans", Partition: 0, ConsumedTo: 50, ResetTo: 10})
+		real, dataLoss := classifyFetchError(kgo.FetchError{Err: wrapped})
+
+		require.True(t, real)
+		require.NotNil(t, dataLoss)
+		require.Equal(t, int64(10), dataLoss.ResetTo)
+		require.Equal(t, int64(50), dataLoss.ConsumedTo)
+	})
 }

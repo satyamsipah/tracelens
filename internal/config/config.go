@@ -179,6 +179,16 @@ type Assembler struct {
 	DecidedCacheSize int
 	DecidedCacheTTL  time.Duration
 
+	// WatermarkMaxAge/WatchdogInterval bound the offset-watermark stuck-floor
+	// safety net (sampling.Assembler.RunWatermarkWatchdog): an entry held
+	// longer than WatermarkMaxAge, with its trace no longer tracked anywhere,
+	// is a permanently failed write that was never redelivered -- not
+	// something DecisionWait's normal bound could produce on its own. Default
+	// is a large, deliberate multiple of DecisionWait so it never mistakes a
+	// trace still legitimately in flight for an abandoned one.
+	WatermarkMaxAge        time.Duration
+	WatermarkCheckInterval time.Duration
+
 	// Drain (internal/logs) tuning.
 	DrainDepth        int
 	DrainSimilarity   float64
@@ -290,6 +300,9 @@ func LoadAssembler() Assembler {
 		SweepInterval:    envDuration("TRACELENS_SWEEP_INTERVAL", 500*time.Millisecond),
 		DecidedCacheSize: envInt("TRACELENS_DECIDED_CACHE_SIZE", 100_000),
 		DecidedCacheTTL:  envDuration("TRACELENS_DECIDED_CACHE_TTL", 5*time.Minute),
+
+		WatermarkMaxAge:        envDuration("TRACELENS_WATERMARK_MAX_AGE", 10*time.Minute),
+		WatermarkCheckInterval: envDuration("TRACELENS_WATERMARK_CHECK_INTERVAL", 30*time.Second),
 
 		DrainDepth:        envInt("TRACELENS_DRAIN_DEPTH", 4),
 		DrainSimilarity:   envFloat("TRACELENS_DRAIN_SIMILARITY", 0.6),

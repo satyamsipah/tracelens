@@ -115,13 +115,17 @@ func run(log *slog.Logger) error {
 	g, gctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		return consumer.RunWithCommitGate(gctx, h.handle, h.commitCeiling)
+		return consumer.RunWithCommitGate(gctx, h.handle, h.commitCeiling, h.handleDataLoss)
 	})
 	g.Go(func() error { return admin.Start() })
 
 	sweepStop := make(chan struct{})
 	go assembler.RunSweep(sweepStop, cfg.SweepInterval)
 	defer close(sweepStop)
+
+	watermarkStop := make(chan struct{})
+	go assembler.RunWatermarkWatchdog(watermarkStop, cfg.WatermarkCheckInterval, cfg.WatermarkMaxAge)
+	defer close(watermarkStop)
 
 	reloadStop := make(chan struct{})
 	go sampling.NewPolicyFileWatcherWithMetrics(cfg.PolicyFile, cfg.ReloadInterval, assembler, log, metrics).Run(reloadStop)
@@ -175,6 +179,17 @@ func (h *handler) commitCeiling(topic string, partition int32) (int64, bool) {
 		return 0, false
 	}
 	return h.assembler.SafeCommitOffset(partition)
+}
+
+// handleDataLoss routes a proven Kafka data-loss event (see
+// pipeline.DataLossFunc) to the assembler's watermark only for the spans
+// topic -- logs and metrics have no watermark to release, since neither is
+// ever held back by buffered, delayed decisions the way spans are.
+func (h *handler) handleDataLoss(topic string, partition int32, resetTo, consumedTo int64) {
+	if topic != h.cfg.Kafka.TopicSpans {
+		return
+	}
+	h.assembler.HandleDataLoss(partition, resetTo, consumedTo)
 }
 
 // handle decodes one poll's records for one topic.

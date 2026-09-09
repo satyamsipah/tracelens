@@ -49,6 +49,21 @@ type CommitCeiling func(topic string, partition int32) (offset int64, ok bool)
 // Consumer's original behavior exactly for topics with no buffering.
 func commitAll(string, int32) (int64, bool) { return 0, false }
 
+// DataLossFunc is invoked when franz-go reports *kgo.ErrDataLoss -- a
+// broker-side reset where the client's known position no longer
+// corresponds to anything the broker has (e.g. the broker's own data was
+// wiped and restarted; not the same thing as ordinary retention aging out
+// old segments, though the client-visible symptom is similar). resetTo and
+// consumedTo are franz-go's own fields: everything in [resetTo, consumedTo)
+// is PROVEN gone -- this is the client telling the caller, precisely and
+// immediately, which offsets will never be redelivered, rather than the
+// caller having to guess from a timeout. nil means data loss is only
+// logged generically (ConsumeErrors already counts every fetch error,
+// including this one); a caller holding a commit-gate watermark on this
+// topic should use this to release any floor pointing into the lost range,
+// or that floor can never resolve on its own.
+type DataLossFunc func(topic string, partition int32, resetTo, consumedTo int64)
+
 // Consumer reads a consumer group and dispatches per topic.
 type Consumer struct {
 	client *kgo.Client
@@ -82,16 +97,19 @@ func NewConsumer(cfg config.Kafka, m *observability.Metrics, log *slog.Logger) (
 // RunWithCommitGate(ctx, handle, nil) -- every offset this poll fetched is
 // committed once every topic's handler succeeds, exactly as before.
 func (c *Consumer) Run(ctx context.Context, handle Handler) error {
-	return c.RunWithCommitGate(ctx, handle, nil)
+	return c.RunWithCommitGate(ctx, handle, nil, nil)
 }
 
 // RunWithCommitGate is Run, plus a per-partition ceiling consulted before
-// committing. When ceiling is nil, or returns ok=false for a partition, that
-// partition commits up to the highest offset THIS POLL fetched -- identical
-// to Run. When ceiling returns ok=true with a lower offset, only that lower
-// offset is committed for this partition, and the remainder is retried on a
-// later poll once the ceiling advances.
-func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceiling CommitCeiling) error {
+// committing, and an optional data-loss callback. When ceiling is nil, or
+// returns ok=false for a partition, that partition commits up to the
+// highest offset THIS POLL fetched -- identical to Run. When ceiling
+// returns ok=true with a lower offset, only that lower offset is committed
+// for this partition, and the remainder is retried on a later poll once the
+// ceiling advances. onDataLoss, if non-nil, is invoked with the exact
+// proven-lost range whenever franz-go reports *kgo.ErrDataLoss -- see
+// DataLossFunc.
+func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceiling CommitCeiling, onDataLoss DataLossFunc) error {
 	if ceiling == nil {
 		ceiling = commitAll
 	}
@@ -128,7 +146,8 @@ func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceilin
 				if ctx.Err() != nil {
 					return nil
 				}
-				if errors.Is(e.Err, context.DeadlineExceeded) {
+				real, dataLoss := classifyFetchError(e)
+				if !real {
 					// Our own commitRetryInterval wake-up timing out, not a
 					// real fetch failure -- there is simply nothing new to
 					// fetch. Fall through so the commit-retry logic below
@@ -141,6 +160,10 @@ func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceilin
 					slog.String("topic", e.Topic),
 					slog.Int("partition", int(e.Partition)),
 					slog.String("error", e.Err.Error()))
+
+				if onDataLoss != nil && dataLoss != nil {
+					onDataLoss(dataLoss.Topic, dataLoss.Partition, dataLoss.ResetTo, dataLoss.ConsumedTo)
+				}
 			}
 			if realErr {
 				continue
@@ -216,6 +239,25 @@ func (c *Consumer) RunWithCommitGate(ctx context.Context, handle Handler, ceilin
 			}
 		}
 	}
+}
+
+// classifyFetchError reports whether e represents a genuine fetch failure
+// (not just RunWithCommitGate's own poll-timeout wakeup returning
+// context.DeadlineExceeded), and unwraps *kgo.ErrDataLoss from it when
+// present. Pulled out of the poll loop specifically so it can be tested
+// directly against a hand-built kgo.FetchError -- reproducing a genuine
+// franz-go ErrDataLoss against a real broker turns out to need an actively
+// live client session with an established leader epoch (KIP-320 truncation
+// detection; see consumer_test.go's investigation), not just a fresh
+// consumer resuming from a stale committed offset, which made a reliable
+// live repro impractical. This tests the exact same code RunWithCommitGate
+// calls, just with an error value constructed directly.
+func classifyFetchError(e kgo.FetchError) (real bool, dataLoss *kgo.ErrDataLoss) {
+	if errors.Is(e.Err, context.DeadlineExceeded) {
+		return false, nil
+	}
+	errors.As(e.Err, &dataLoss)
+	return true, dataLoss
 }
 
 // Close leaves the group cleanly so partitions rebalance promptly.

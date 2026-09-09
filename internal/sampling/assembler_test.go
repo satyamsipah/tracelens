@@ -282,3 +282,126 @@ func TestErrorsAlwaysRetainedAtOverallLowRate(t *testing.T) {
 		require.InDelta(t, 0.05, normalSampleRate, 0.02, "non-error traces must sample near the configured baseline rate")
 	})
 }
+
+func TestAssemblerHandleDataLoss(t *testing.T) {
+	t.Run("should release a watermark entry Kafka proved is unreachable, and count it", func(t *testing.T) {
+		cfg := testBufferConfig(EvictionForcedDecision)
+		cfg.DecisionWait = time.Hour
+		m := observability.NewMetrics()
+		buf := NewBuffer(cfg, m)
+
+		emit := func([]storage.SpanRow, Decision) error { return errWriteFailed }
+		a := NewAssembler(buf, NewPolicyChain([]Policy{NewProbabilistic(1.0)}), m,
+			observability.NewLogger("test"), emit, func(storage.SpanRow) error { return nil })
+
+		// Root-closure early exit decides (and fails to write) synchronously,
+		// leaving the watermark held at offset 41 -- identical setup to
+		// TestAssemblerWithholdsWatermarkOnWriteFailure.
+		root := spanForTrace(1, 1, 0, 0, 10, "ok")
+		a.Ingest(root, 0, 42)
+
+		_, hasFloor := a.SafeCommitOffset(0)
+		require.True(t, hasFloor, "precondition: the failed write must leave the offset held")
+
+		// Kafka proves everything below offset 100 on partition 0 is gone --
+		// this covers the held offset (41).
+		a.HandleDataLoss(0, 0, 100)
+
+		_, hasFloor = a.SafeCommitOffset(0)
+		require.False(t, hasFloor, "a proven-lost offset must release the floor immediately")
+		require.Equal(t, float64(1), testutil.ToFloat64(m.OffsetWatermarkDataLossTotal))
+	})
+
+	t.Run("should not touch a watermark entry outside the lost range", func(t *testing.T) {
+		cfg := testBufferConfig(EvictionForcedDecision)
+		cfg.DecisionWait = time.Hour
+		m := observability.NewMetrics()
+		buf := NewBuffer(cfg, m)
+
+		emit := func([]storage.SpanRow, Decision) error { return errWriteFailed }
+		a := NewAssembler(buf, NewPolicyChain([]Policy{NewProbabilistic(1.0)}), m,
+			observability.NewLogger("test"), emit, func(storage.SpanRow) error { return nil })
+
+		root := spanForTrace(1, 1, 0, 0, 10, "ok")
+		a.Ingest(root, 0, 500) // held at offset 500, well above the lost range
+
+		a.HandleDataLoss(0, 0, 100) // proven-lost range is [0, 100)
+
+		_, hasFloor := a.SafeCommitOffset(0)
+		require.True(t, hasFloor, "an entry outside the proven-lost range must not be released")
+		require.Equal(t, float64(0), testutil.ToFloat64(m.OffsetWatermarkDataLossTotal))
+	})
+
+	t.Run("should no-op when nothing is held on the affected partition", func(t *testing.T) {
+		a, capture, m := newTestAssembler(t, testBufferConfig(EvictionForcedDecision), NewPolicyChain([]Policy{NewProbabilistic(1.0)}))
+		_ = capture
+		require.NotPanics(t, func() { a.HandleDataLoss(0, 0, 1000) })
+		require.Equal(t, float64(0), testutil.ToFloat64(m.OffsetWatermarkDataLossTotal))
+	})
+}
+
+func TestAssemblerWatermarkWatchdog(t *testing.T) {
+	t.Run("should expire an orphaned entry once it exceeds maxAge, and count it", func(t *testing.T) {
+		cfg := testBufferConfig(EvictionForcedDecision)
+		cfg.DecisionWait = time.Hour
+		m := observability.NewMetrics()
+		buf := NewBuffer(cfg, m)
+
+		emit := func([]storage.SpanRow, Decision) error { return errWriteFailed }
+		a := NewAssembler(buf, NewPolicyChain([]Policy{NewProbabilistic(1.0)}), m,
+			observability.NewLogger("test"), emit, func(storage.SpanRow) error { return nil })
+
+		root := spanForTrace(1, 1, 0, 0, 10, "ok")
+		a.Ingest(root, 0, 42) // write fails, trace leaves the buffer, watermark held at 41
+
+		_, hasFloor := a.SafeCommitOffset(0)
+		require.True(t, hasFloor, "precondition")
+
+		a.checkWatermarkOnce(time.Now().Add(time.Hour), 10*time.Minute)
+
+		_, hasFloor = a.SafeCommitOffset(0)
+		require.False(t, hasFloor, "an orphaned entry (write failed, no redelivery, no longer tracked) must be expired past maxAge")
+		require.Equal(t, float64(1), testutil.ToFloat64(m.OffsetWatermarkExpiredTotal))
+	})
+
+	t.Run("should NOT expire an entry whose trace is still legitimately in-flight", func(t *testing.T) {
+		cfg := testBufferConfig(EvictionForcedDecision)
+		cfg.DecisionWait = 24 * time.Hour // never completes on its own during this test
+		m := observability.NewMetrics()
+		buf := NewBuffer(cfg, m)
+		a := NewAssembler(buf, NewPolicyChain([]Policy{NewProbabilistic(1.0)}), m,
+			observability.NewLogger("test"), func([]storage.SpanRow, Decision) error { return nil },
+			func(storage.SpanRow) error { return nil })
+
+		// A non-root span never satisfies early-exit, so it stays genuinely
+		// buffered -- exactly the case the watchdog must not disturb, even
+		// though its watermark entry is now "old" by the same measure.
+		child := spanForTrace(1, 2, 1, 0, 10, "ok")
+		a.Ingest(child, 0, 42)
+
+		a.checkWatermarkOnce(time.Now().Add(time.Hour), 10*time.Minute)
+
+		_, hasFloor := a.SafeCommitOffset(0)
+		require.True(t, hasFloor, "a trace still tracked in the buffer must never have its floor released out from under it")
+		require.Equal(t, float64(0), testutil.ToFloat64(m.OffsetWatermarkExpiredTotal))
+	})
+
+	t.Run("should not expire an entry younger than maxAge", func(t *testing.T) {
+		cfg := testBufferConfig(EvictionForcedDecision)
+		cfg.DecisionWait = time.Hour
+		m := observability.NewMetrics()
+		buf := NewBuffer(cfg, m)
+		emit := func([]storage.SpanRow, Decision) error { return errWriteFailed }
+		a := NewAssembler(buf, NewPolicyChain([]Policy{NewProbabilistic(1.0)}), m,
+			observability.NewLogger("test"), emit, func(storage.SpanRow) error { return nil })
+
+		root := spanForTrace(1, 1, 0, 0, 10, "ok")
+		a.Ingest(root, 0, 42)
+
+		a.checkWatermarkOnce(time.Now(), 10*time.Minute) // no time has passed
+
+		_, hasFloor := a.SafeCommitOffset(0)
+		require.True(t, hasFloor, "an entry younger than maxAge must be left alone")
+		require.Equal(t, float64(0), testutil.ToFloat64(m.OffsetWatermarkExpiredTotal))
+	})
+}

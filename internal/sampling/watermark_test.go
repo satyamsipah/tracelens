@@ -2,6 +2,7 @@ package sampling
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -137,5 +138,86 @@ func TestOffsetWatermarkCrashRecoverySimulation(t *testing.T) {
 
 		_, hasFloor = w.SafeOffset(0)
 		require.False(t, hasFloor, "once the last holdout resolves, nothing should gate the commit anymore")
+	})
+}
+
+func TestOffsetWatermarkClearBelow(t *testing.T) {
+	t.Run("should clear only entries strictly below threshold and return their trace ids", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		id1, id2, id3 := [16]byte{1}, [16]byte{2}, [16]byte{3}
+		w.Track(0, 100, id1)
+		w.Track(0, 200, id2)
+		w.Track(0, 300, id3)
+
+		cleared := w.ClearBelow(0, 250)
+
+		require.ElementsMatch(t, [][16]byte{id1, id2}, cleared, "only offsets < 250 are proven lost")
+		offset, hasFloor := w.SafeOffset(0)
+		require.True(t, hasFloor)
+		require.Equal(t, int64(299), offset, "the surviving entry (300) must still gate the commit")
+	})
+
+	t.Run("should be a no-op on an untracked partition", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		require.Empty(t, w.ClearBelow(7, 1000))
+	})
+
+	t.Run("should clear everything when threshold exceeds every tracked offset", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		w.Track(0, 100, [16]byte{1})
+		w.Track(0, 200, [16]byte{2})
+
+		cleared := w.ClearBelow(0, 1_000_000)
+
+		require.Len(t, cleared, 2)
+		_, hasFloor := w.SafeOffset(0)
+		require.False(t, hasFloor, "clearing every entry must fully release the floor")
+	})
+
+	t.Run("should not disturb a different partition", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		w.Track(0, 100, [16]byte{1})
+		w.Track(1, 100, [16]byte{2})
+
+		w.ClearBelow(0, 1_000_000)
+
+		_, hasFloorP0 := w.SafeOffset(0)
+		offsetP1, hasFloorP1 := w.SafeOffset(1)
+		require.False(t, hasFloorP0)
+		require.True(t, hasFloorP1)
+		require.Equal(t, int64(99), offsetP1)
+	})
+}
+
+func TestOffsetWatermarkStaleCandidates(t *testing.T) {
+	t.Run("should report nothing when every entry is younger than maxAge", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		w.Track(0, 100, [16]byte{1})
+		require.Empty(t, w.StaleCandidates(time.Hour, time.Now()))
+	})
+
+	t.Run("should report an entry once its age reaches maxAge", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		id := [16]byte{9}
+		w.Track(3, 555, id)
+
+		future := time.Now().Add(time.Hour)
+		stale := w.StaleCandidates(30*time.Minute, future)
+
+		require.Len(t, stale, 1)
+		require.Equal(t, int32(3), stale[0].Partition)
+		require.Equal(t, int64(555), stale[0].Offset)
+		require.Equal(t, id, stale[0].TraceID)
+		require.GreaterOrEqual(t, stale[0].Age, 30*time.Minute)
+	})
+
+	t.Run("should report across every partition, not just one", func(t *testing.T) {
+		w := NewOffsetWatermark()
+		w.Track(0, 1, [16]byte{1})
+		w.Track(1, 2, [16]byte{2})
+		w.Track(2, 3, [16]byte{3})
+
+		stale := w.StaleCandidates(0, time.Now().Add(time.Second))
+		require.Len(t, stale, 3, "every tracked entry across every partition should be a candidate once old enough")
 	})
 }

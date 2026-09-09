@@ -224,6 +224,87 @@ func (a *Assembler) decide(spans []storage.SpanRow) Decision {
 	return d
 }
 
+// HandleDataLoss releases the commit floor for any watermark entries on
+// partition pointing into a range Kafka has proven permanently unreachable
+// (see pipeline.DataLossFunc, wired as the consumer's onDataLoss callback).
+// This is the precise fix for a real, reproduced bug (docs/DECISIONS.md
+// Phase 4 Sec 8): a trace whose decide-and-write failed leaves its
+// watermark entry held, waiting for Kafka to redeliver the same message for
+// a retry -- but if the broker itself loses the underlying data (observed:
+// a Redpanda restart mid-session, every partition reset to offset 0), that
+// redelivery can never happen, and the floor would otherwise stay stuck
+// forever. Kafka's own ErrDataLoss tells us exactly which offsets are gone,
+// so this fires immediately and only for offsets proven lost -- it cannot
+// release a floor under a trace that is still genuinely being processed.
+func (a *Assembler) HandleDataLoss(partition int32, resetTo, consumedTo int64) {
+	cleared := a.wm.ClearBelow(partition, consumedTo)
+	if len(cleared) == 0 {
+		return
+	}
+
+	a.mu.Lock()
+	for _, id := range cleared {
+		delete(a.partitionOf, id)
+	}
+	a.mu.Unlock()
+
+	a.m.OffsetWatermarkDataLossTotal.Add(float64(len(cleared)))
+	a.log.Error("kafka reported unrecoverable data loss; released watermark entries pointing into the lost range -- these traces' remaining spans are gone and were never written",
+		slog.Int("partition", int(partition)),
+		slog.Int64("reset_to", resetTo),
+		slog.Int64("consumed_to", consumedTo),
+		slog.Int("watermark_entries_cleared", len(cleared)))
+}
+
+// RunWatermarkWatchdog is the safety net for the OTHER way a watermark
+// entry can get stuck: a write that fails permanently for a reason
+// unrelated to broker data loss (a "poison" row ClickHouse always rejects)
+// never triggers ErrDataLoss at all, since the data is still sitting in
+// Kafka, technically retriable -- it just never succeeds. Buffer guarantees
+// every trace resolves within DecisionWait (or immediately on capacity
+// eviction), so an entry still held after maxAge (which must be
+// comfortably larger than DecisionWait) can only be write-failed limbo,
+// never genuinely still-buffered work. Buffer.Tracks is still checked
+// before giving up, defending specifically against the one dangerous
+// case this reasoning depends on holding: a redelivered retry keeps its
+// ORIGINAL trackedAt (Track is first-offset-wins), so an active retry
+// that happens to be old would otherwise look identical to an abandoned
+// one by age alone.
+func (a *Assembler) RunWatermarkWatchdog(stop <-chan struct{}, tick, maxAge time.Duration) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-ticker.C:
+			a.checkWatermarkOnce(now, maxAge)
+		}
+	}
+}
+
+// checkWatermarkOnce is RunWatermarkWatchdog's per-tick logic, pulled out
+// so a test can drive it directly against an explicit `now` rather than
+// waiting on a real ticker.
+func (a *Assembler) checkWatermarkOnce(now time.Time, maxAge time.Duration) {
+	for _, e := range a.wm.StaleCandidates(maxAge, now) {
+		if a.buffer.Tracks(e.TraceID) {
+			continue // still legitimately known; leave it for normal completion
+		}
+		a.wm.Resolve(e.Partition, e.TraceID)
+		a.mu.Lock()
+		delete(a.partitionOf, e.TraceID)
+		a.mu.Unlock()
+
+		a.m.OffsetWatermarkExpiredTotal.Inc()
+		a.log.Error("offset watermark entry expired: held far longer than DecisionWait and no longer tracked anywhere; giving up and releasing its commit floor",
+			slog.Int("partition", int(e.Partition)),
+			slog.Int64("offset", e.Offset),
+			slog.Duration("held_for", e.Age))
+	}
+}
+
 // finishTrace releases assembler-side bookkeeping for a trace that just
 // decided (normally, early-exited, or was forced), resolving the offset
 // watermark on its partition.

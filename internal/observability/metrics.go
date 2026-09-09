@@ -79,6 +79,14 @@ type Metrics struct {
 	SamplingWeight       prometheus.Histogram
 	RoutingMismatchTotal prometheus.Counter
 
+	// ---- offset-watermark stuck-floor recovery ------------------------------
+	// Both fire only in genuinely exceptional circumstances -- a broker-side
+	// data-loss event, or a write that failed permanently and was never
+	// redelivered -- and both represent a documented, counted give-up
+	// (CLAUDE.md principle 1), not a silent one.
+	OffsetWatermarkDataLossTotal prometheus.Counter // entries released because Kafka proved the offsets unreachable
+	OffsetWatermarkExpiredTotal  prometheus.Counter // entries released by the age-bound watchdog, cause unproven
+
 	// ---- cardinality control ------------------------------------------------
 	CardinalityBreaches         *prometheus.CounterVec // key
 	CardinalityEstimate         *prometheus.GaugeVec   // key -- current HLL estimate, for the dashboard
@@ -247,6 +255,14 @@ func NewMetrics() *Metrics {
 		Name: "tracelens_routing_mismatch_total",
 		Help: "Trace ids observed by an assembler that a consistent-hash Router would assign elsewhere. Diagnostic only.",
 	})
+	m.OffsetWatermarkDataLossTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_offset_watermark_data_loss_total",
+		Help: "Offset-watermark entries released because Kafka reported the underlying offsets as permanently, provably lost (kgo.ErrDataLoss) -- these traces' remaining spans are gone and were never written.",
+	})
+	m.OffsetWatermarkExpiredTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tracelens_offset_watermark_expired_total",
+		Help: "Offset-watermark entries force-released by the age-bound watchdog after far longer than DecisionWait with no trace found anywhere -- a permanently failed write that was never redelivered, not proven data loss.",
+	})
 
 	m.CardinalityBreaches = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "tracelens_cardinality_breaches_total",
@@ -303,6 +319,7 @@ func NewMetrics() *Metrics {
 		m.InflightTraces, m.InflightBytes, m.ForcedDecisionsTotal, m.EvictedTracesTotal,
 		m.LateSpansTotal, m.DecisionsTotal, m.DecisionLatency, m.SamplingWeight,
 		m.RoutingMismatchTotal,
+		m.OffsetWatermarkDataLossTotal, m.OffsetWatermarkExpiredTotal,
 		m.CardinalityBreaches, m.CardinalityEstimate, m.CardinalityKeysEvictedTotal,
 		m.RateLimiterServicesTracked, m.RateLimiterServicesEvictedTotal,
 		m.TemplatesTotal, m.TemplatesCreatedTotal, m.TemplatesEvictedTotal,

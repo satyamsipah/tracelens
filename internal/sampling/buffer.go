@@ -333,6 +333,22 @@ func (b *Buffer) Stats() (traces int, bytes int64) {
 	return len(b.inflight), b.totalBytes
 }
 
+// Tracks reports whether id is currently known to the buffer -- either
+// still in-flight or present in the decided cache. Used by the offset-
+// watermark watchdog to confirm a stale-looking held offset isn't actually
+// a trace still being legitimately processed (or one that decided and is
+// only waiting out its decided-cache TTL) before concluding it is
+// genuinely orphaned and safe to give up on.
+func (b *Buffer) Tracks(id [16]byte) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.inflight[id]; ok {
+		return true
+	}
+	_, ok := b.decided[id]
+	return ok
+}
+
 // ageHeap is a container/heap.Interface over *bufferedTrace, ordered by
 // firstSeen ascending -- oldest at index 0.
 type ageHeap []*bufferedTrace

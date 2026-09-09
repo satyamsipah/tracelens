@@ -3,6 +3,7 @@ package sampling
 import (
 	"container/heap"
 	"sync"
+	"time"
 )
 
 // OffsetWatermark tracks, per Kafka partition, the lowest offset among
@@ -36,6 +37,11 @@ type offsetEntry struct {
 	offset    int64
 	traceID   [16]byte
 	heapIndex int
+
+	// trackedAt is wall-clock time at Track, used only by the watchdog
+	// (StaleCandidates) to bound how long an entry may be held -- unrelated
+	// to offset ordering, so it does not participate in the heap at all.
+	trackedAt time.Time
 }
 
 // NewOffsetWatermark builds an empty tracker.
@@ -58,7 +64,7 @@ func (w *OffsetWatermark) Track(partition int32, offset int64, traceID [16]byte)
 		return
 	}
 
-	e := &offsetEntry{offset: offset, traceID: traceID}
+	e := &offsetEntry{offset: offset, traceID: traceID, trackedAt: time.Now()}
 	pw.byTrace[traceID] = e
 	heap.Push(&pw.h, e)
 }
@@ -97,6 +103,74 @@ func (w *OffsetWatermark) SafeOffset(partition int32) (offset int64, hasFloor bo
 		return 0, false
 	}
 	return pw.h[0].offset - 1, true
+}
+
+// ClearBelow removes every entry on partition whose tracked offset is less
+// than threshold, returning the cleared trace ids (so the caller can also
+// drop its own bookkeeping for them, e.g. Assembler.partitionOf). Used when
+// the Kafka client itself has proven those offsets unreachable
+// (kgo.ErrDataLoss -- see pipeline.DataLossFunc): the normal rule ("only
+// Resolve once a trace actually decides") does not apply here, because
+// there is no future in which those specific offsets are ever redelivered
+// for a decision to happen at all. Without this, a watermark entry pointing
+// below threshold would hold its partition's commit floor forever -- an
+// unbounded, silent stall, which is worse than the proven, already-happened
+// data loss this merely stops from compounding into a stuck consumer too.
+func (w *OffsetWatermark) ClearBelow(partition int32, threshold int64) [][16]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	pw, ok := w.partitions[partition]
+	if !ok {
+		return nil
+	}
+	var cleared []*offsetEntry
+	for _, e := range pw.h {
+		if e.offset < threshold {
+			cleared = append(cleared, e)
+		}
+	}
+	ids := make([][16]byte, len(cleared))
+	for i, e := range cleared {
+		ids[i] = e.traceID
+		delete(pw.byTrace, e.traceID)
+		heap.Remove(&pw.h, e.heapIndex)
+	}
+	return ids
+}
+
+// StaleEntry is one watermark entry that has been held longer than a
+// caller-supplied age bound -- a CANDIDATE for giving up on, not yet
+// confirmed safe to. Buffer guarantees every trace resolves within
+// DecisionWait (or immediately on capacity eviction), so an entry this old
+// can only be a trace whose decide-and-write failed and was never
+// redelivered -- but the caller must still confirm the trace is not
+// otherwise tracked (Buffer.Tracks) before actually resolving it, since a
+// entry's age alone does not distinguish "abandoned" from "an active retry
+// that happens to share the original, still-correct floor offset" (Track
+// is first-offset-wins, so a redelivered retry does not reset trackedAt).
+type StaleEntry struct {
+	Partition int32
+	Offset    int64
+	TraceID   [16]byte
+	Age       time.Duration
+}
+
+// StaleCandidates returns every entry across all partitions held longer
+// than maxAge as of now.
+func (w *OffsetWatermark) StaleCandidates(maxAge time.Duration, now time.Time) []StaleEntry {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var out []StaleEntry
+	for partition, pw := range w.partitions {
+		for _, e := range pw.h {
+			if age := now.Sub(e.trackedAt); age >= maxAge {
+				out = append(out, StaleEntry{Partition: partition, Offset: e.offset, TraceID: e.traceID, Age: age})
+			}
+		}
+	}
+	return out
 }
 
 // Pending reports how many traces are currently tracked on partition, for
