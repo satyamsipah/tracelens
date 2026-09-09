@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -107,11 +108,11 @@ func (m MultiSink) Notify(ctx context.Context, n Notification) error {
 	if len(errs) == 0 {
 		return nil
 	}
-	joined := errs[0]
-	for _, e := range errs[1:] {
-		joined = fmt.Errorf("%w; %v", joined, e)
-	}
-	return joined
+	// errors.Join, not a chain of fmt.Errorf("%w; %v", ...): the %v verb
+	// formatted every error after the first into a plain string, so
+	// errors.Is/As could only ever match the first sink's failure. With
+	// fan-out to several sinks that is exactly the wrong one to keep.
+	return errors.Join(errs...)
 }
 
 // SinksFor builds the fan-out sink a rule's configured endpoints imply.
