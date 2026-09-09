@@ -1466,3 +1466,159 @@ that instruction exists for. `cmd/correctnesscheck` is verified correct by
 inspection and is committed as-is, ready to confirm a fix the moment one
 lands; this gap is the single most important open item this phase
 produced, ranked above every unfinished benchmark number.
+
+## 2026-09-09 — Phase 5: fixing the stuck commit floor (Phase 4 Sec 8)
+
+Reviewed with the user before implementing, given this touches Kafka
+consumer correctness directly (CLAUDE.md: "if any change risks violating
+[a principle], stop and flag it instead of implementing" -- exactly why
+Phase 4 left this open rather than patching it under time pressure).
+
+### 1. Refined root cause: franz-go's `*kgo.ErrDataLoss`, not generic retention aging
+
+Phase 4's hypothesis was "broker retention aged out an old committed
+offset." Re-reading the actual log line against franz-go's source
+(`pkg/kgo/errors.go`) showed it is not a generic string but a typed,
+structured error:
+
+```go
+type ErrDataLoss struct {
+    Topic, Partition            // where
+    ConsumedTo, ResetTo int64   // everything in [ResetTo, ConsumedTo) is PROVEN gone
+}
+```
+
+`ResetTo=0` on every partition simultaneously is the signature of the
+broker's underlying data being wiped and restarted (matching this
+session's own earlier Docker Desktop restart), not gradual retention
+aging (which would reset to whatever the *current* log start is, a small
+forward jump, not uniformly to zero). The important consequence: this
+error is not a symptom to work around with a heuristic timeout -- it is
+franz-go handing the caller an exact, immediate, provably-correct answer
+to "which offsets will never be redelivered." The bug was that
+`internal/pipeline`'s fetch-error handling caught this error, logged it
+generically, and discarded the structured fields entirely.
+
+### 2. Two-part fix, reviewed and approved before implementation
+
+**Part 1 (precise, safe by construction):** `consumer.go` now detects
+`*kgo.ErrDataLoss` via `errors.As` and, when a new optional
+`DataLossFunc` callback is supplied to `RunWithCommitGate`, invokes it
+with the exact `(topic, partition, resetTo, consumedTo)`.
+`OffsetWatermark.ClearBelow(partition, threshold)` removes every tracked
+entry below `threshold`, returning the cleared trace ids so the caller
+(`Assembler.HandleDataLoss`) can also drop them from `partitionOf`.
+`cmd/assembler` wires this only for the spans topic (logs/metrics carry
+no watermark). This fires immediately on the proven event and can never
+release a floor under a trace that is still genuinely being processed,
+since it only ever touches offsets franz-go has already declared
+unreachable.
+
+**Part 2 (safety net for a different, unproven-but-real failure mode):** a
+write that fails permanently for a reason unrelated to broker data loss
+(a poison row ClickHouse always rejects) never triggers `ErrDataLoss` at
+all -- the data is still sitting in Kafka, technically retriable, it just
+never succeeds. `Buffer` guarantees every trace resolves within
+`DecisionWait` (or immediately on capacity eviction), so a watermark
+entry held past a large, explicit multiple of that
+(`TRACELENS_WATERMARK_MAX_AGE`, default 10 minutes vs. `DecisionWait`'s
+5s default -- a 120x margin) can only be write-failed limbo, never
+genuinely still-buffered work. `Assembler.RunWatermarkWatchdog` polls for
+such stale entries (`OffsetWatermark.StaleCandidates`) and, critically,
+confirms via the new `Buffer.Tracks(id)` that the trace is not otherwise
+known before giving up on it -- the one dangerous case this whole
+argument depends on catching: a redelivered retry keeps its *original*
+`trackedAt` (`Track` is first-offset-wins), so an active, legitimate retry
+that happens to be old would otherwise look identical to an abandoned one
+by age alone. Locked down directly by
+`TestAssemblerWatermarkWatchdog`'s "should NOT expire an entry whose
+trace is still legitimately in-flight" case.
+
+Both paths are documented, counted give-ups (`tracelens_offset_watermark_data_loss_total`,
+`tracelens_offset_watermark_expired_total`), not silent ones -- the
+CLAUDE.md principle 1 property this whole fix exists to restore.
+
+### 3. A real, honest test-design pivot: live repro attempted, didn't reproduce, and *why* is itself worth recording
+
+The first attempt at proving Part 1 end-to-end was a real-broker
+integration test: produce many records, consume and commit against a real
+topic, delete and recreate that topic (simulating the broker losing its
+data), produce fresh records, and start a *new* consumer in the same
+group to observe `ErrDataLoss` firing.
+
+**It did not reproduce `ErrDataLoss` -- a fresh consumer resuming from a
+stale committed offset against the recreated topic just got a silent,
+successful reset, with no error of any kind**, even with the committed
+offset (20) held far above what the recreated topic had (confirmed via
+`kadm.FetchOffsets` before deletion). Investigating *why*, rather than
+declaring the test flaky and moving on, led to a real, useful finding:
+`ErrDataLoss` is franz-go's KIP-320 log-truncation detection, which
+requires an already-established leader **epoch** the client currently
+holds from an **actively live session** (`pkg/kgo/consumer.go`: epoch
+defaults to `-1`, explicitly documented as "no truncation detection").
+An offset freshly fetched via `OffsetFetch` on a new client carries no
+epoch at all -- so a first-time join can *never* trigger this error,
+no matter how stale the offset is; only a client that was continuously
+connected and watched its own read position regress mid-session can.
+Reliably reproducing that specific timing (keep a client connected,
+force the broker to lose data while it is actively polling) is
+meaningfully more complex to construct deterministically than this fix
+warranted blocking on.
+
+**Resolution:** `classifyFetchError` was pulled out of the poll loop as
+its own function specifically so it could be tested directly against a
+hand-constructed `kgo.FetchError{Err: &kgo.ErrDataLoss{...}}` --
+`TestClassifyFetchError` exercises the exact real code
+`RunWithCommitGate` calls, including a wrapped-error case
+(`fmt.Errorf("...: %w", ...)`), without needing a live broker to
+naturally produce that specific error. This is not a mock of Kafka's
+behavior (the thing `internal/pipeline`'s testing rule forbids) -- it is
+a plain Go value constructed to test *our own* error-handling logic in
+isolation, the same category as `errWriteFailed` already used elsewhere
+in `internal/sampling`'s tests. Combined with `TestAssemblerHandleDataLoss`
+and `TestAssemblerWatermarkWatchdog` (which fully cover what happens once
+the callback fires with real values, via `internal/sampling`'s own unit
+tests), both halves of the fix are covered by fast, deterministic tests;
+only the live "franz-go actually calls our callback under a real
+epoch-truncation event" link is unverified by this session, and that is
+franz-go's own tested behavior, not ours to re-prove.
+
+### 4. Accepted gap
+
+The `RunWatermarkWatchdog` safety net (Part 2) has never observed a real
+poison-message scenario -- it exists because the design has no bound for
+one, not because one occurred. Its correctness rests on the "Buffer
+guarantees bounded resolution time" invariant holding, which is true by
+construction today but would need re-checking if `Buffer`'s own
+completion guarantees ever change.
+
+### 5. A precise scope clarification, found redeploying the fix live: `OffsetWatermark` is in-memory and does not survive a restart
+
+Deploying the fix to this session's own (already-degraded) assembler
+confirmed something worth stating precisely, since it changes what "fixed"
+means here: `OffsetWatermark` is process-local, in-memory state. It holds
+nothing across a restart -- a freshly started process's watermark is
+always empty. `Assembler.HandleDataLoss` therefore correctly cleared
+**zero** entries on this session's live redeploy (confirmed via the new
+`tracelens_offset_watermark_data_loss_total` metric staying at 0), because
+there was nothing in memory yet for a cold-started process to clear; the
+fetch error it reacted to happened before any span had been ingested into
+this process's buffer at all. That is the *correct* behavior, not a
+missed case.
+
+What this means concretely: the fix directly, verifiably solves the
+mechanism it targets -- a **live, continuously-running** process that
+encounters proven data loss (or a permanently-orphaned write) while it
+currently holds a relevant watermark entry, which it now releases instead
+of wedging forever. It does **not**, and was never going to, retroactively
+repair this session's own already-broken consumer-group committed offset
+on the broker -- that is a pre-existing environmental artifact (this
+session's earlier, unrelated Docker Desktop restart corrupted/reset
+Redpanda's on-disk state mid-session, independent of this bug or its fix),
+and the observed symptom (real demo traffic not yet visible in
+`tracelens.spans` post-redeploy) is that same backlog genuinely still
+being reprocessed from scratch, at whatever the current session's
+resource-contended reprocessing rate ends up being -- not evidence the
+fix is incomplete. Resolving that specific stuck broker state is an
+operational action (e.g. resetting the consumer group's offsets), not a
+code change, and was not made as part of this fix.

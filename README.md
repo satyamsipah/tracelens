@@ -644,15 +644,19 @@ These are deliberate and recorded in [docs/DECISIONS.md](docs/DECISIONS.md):
 - **Critical-path computation is a simplification** (follows the child with
   the latest end-time at each level), not full gap-accounting critical-path
   analysis.
-- **A commit-floor watermark can get stuck indefinitely if the trace
-  holding it never resolves**, and once stuck long enough for broker
-  retention to age out that offset, every consumer restart hits a
-  permanent "offset no longer exists" loop — found live while running the
-  Part B correctness-under-load proof, not by inspection. This is the
-  single most important open item in the project right now; see
-  [docs/DECISIONS.md](docs/DECISIONS.md)'s Phase 4 §8 for the full
-  evidence and the reasoning for leaving it open rather than patching a
-  principle-1-critical mechanism under time pressure.
+- **`RunWatermarkWatchdog`'s age-based safety net has never observed a real
+  poison-message scenario** (a write that fails permanently for a reason
+  unrelated to broker data loss) -- it exists because the design has no
+  bound for one, not because one occurred. See
+  [docs/DECISIONS.md](docs/DECISIONS.md)'s Phase 5 §4.
+- **A live reproduction of `kgo.ErrDataLoss` against a real broker was
+  attempted and did not succeed** (Phase 5 §3): the error requires an
+  already-connected client session with an established leader epoch, not
+  just a fresh consumer resuming from a stale committed offset. The fix
+  itself is proven by fast, direct unit tests against the exact code path
+  involved; only the "franz-go actually calls our callback under a live
+  epoch-truncation event" link is unverified here, and that is franz-go's
+  own tested behavior.
 
 ## Roadmap
 
@@ -662,7 +666,10 @@ These are deliberate and recorded in [docs/DECISIONS.md](docs/DECISIONS.md):
 4. ~~Query engine: DSL → AST → logical plan → physical plan~~ — done
 5. ~~Service graph, RED rollups, anomaly detection, alerting~~ — done
 6. ~~UI: trace waterfall, flamegraph, service map, log explorer, query explorer, system health~~ — done
-7. ~~Load testing and benchmarks (Part B)~~ — done, with two open items: the
-   100M-row query-engine scale target (reached ~25-30M in-session; see
-   [docs/BENCHMARKS.md](docs/BENCHMARKS.md)) and the stuck-commit-floor bug
-   below
+7. ~~Load testing and benchmarks (Part B)~~ — done. The 100M-row query-engine
+   scale target reached ~25-30M in-session; see
+   [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+8. ~~Fix the stuck offset-commit floor~~ — done (Phase 5): a precise fix for
+   proven Kafka data loss (`kgo.ErrDataLoss`), plus a bounded age-based
+   safety net for the unrelated case of a permanently failing write. See
+   [docs/DECISIONS.md](docs/DECISIONS.md)'s Phase 5.
