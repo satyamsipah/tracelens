@@ -232,15 +232,37 @@ func NewProbabilistic(rate float64) Policy {
 func (p probabilistic) Name() string { return "probabilistic" }
 
 func (p probabilistic) Evaluate(view TraceView) Decision {
-	// A distinct salt from the Kafka partition-key hash (which hashes the
-	// raw trace_id bytes directly, unsalted) so this decision cannot
-	// correlate with partition assignment even coincidentally.
+	// The boundaries are handled BEFORE any float->uint64 conversion, and
+	// that is load bearing rather than defensive tidiness.
+	//
+	// Converting an out-of-range float to an integer is explicitly
+	// implementation-dependent in Go. float64 cannot represent 2^64-1, so
+	// `rate * float64(^uint64(0))` at rate=1.0 produces exactly 2^64 -- out
+	// of range -- and the conversion then yields 2^64-1 on arm64 but 2^63 on
+	// amd64. The previous code did exactly that: "sample everything" behaved
+	// as 100% on an arm64 dev machine and as 50% on linux/amd64, while still
+	// recording Probability 1.0, so every weighted aggregate over that data
+	// would have been silently wrong by a factor of two (principle 6).
+	//
+	// Found because CI on linux/amd64 failed a test that passed locally.
+	if p.rate >= 1 {
+		return Decision{Verdict: VerdictSample, Probability: 1}
+	}
+	if p.rate <= 0 {
+		return Decision{Verdict: VerdictDrop, Probability: 1}
+	}
+
+	// A distinct salt from the Kafka partition-key hash (which hashes the raw
+	// trace_id bytes directly, unsalted) so this decision cannot correlate
+	// with partition assignment even coincidentally.
 	h := fnv.New64a()
 	_, _ = h.Write([]byte("sampling-decision:"))
 	_, _ = h.Write(view.TraceID[:])
 	score := splitmix64(h.Sum64())
 
-	threshold := uint64(p.rate * float64(^uint64(0)))
+	// rate is strictly inside (0, 1) here, so the product is strictly below
+	// 2^64 and the conversion is always in range on every architecture.
+	threshold := uint64(p.rate * float64(1<<64))
 	if score < threshold {
 		return Decision{Verdict: VerdictSample, Probability: p.rate}
 	}
@@ -389,7 +411,7 @@ func (r *rateLimiter) Evaluate(view TraceView) Decision {
 // unbounded growth.
 func (r *rateLimiter) evictLRULocked() {
 	var oldestKey string
-	var oldestGen uint64 = ^uint64(0)
+	oldestGen := ^uint64(0)
 	for k, b := range r.buckets {
 		if b.lruGen < oldestGen {
 			oldestGen, oldestKey = b.lruGen, k

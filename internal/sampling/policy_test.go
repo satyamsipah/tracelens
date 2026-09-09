@@ -306,3 +306,63 @@ func TestUpweightingRecoversTruePopulation(t *testing.T) {
 			"weighted estimate must recover the true mixed-rate population within 5%%")
 	})
 }
+
+// TestProbabilisticBoundaryRates locks down an architecture-dependent bug:
+// `uint64(rate * float64(^uint64(0)))` at rate=1.0 forms exactly 2^64, and
+// converting an out-of-range float to an integer is implementation-dependent
+// in Go -- arm64 saturated to 2^64-1 (sampling everything, correct by luck)
+// while amd64 yielded 2^63 (sampling half, while still reporting weight 1).
+//
+// The assertions below are architecture-independent by construction: they
+// check every trace, not a rate, so a threshold that silently collapses to
+// half fails everywhere rather than only on the deployment architecture.
+func TestProbabilisticBoundaryRates(t *testing.T) {
+	views := make([]TraceView, 0, 250)
+	for i := 1; i <= 250; i++ {
+		views = append(views, traceViewFrom([]storage.SpanRow{span(byte(i), 0, 0, 10, "ok")}))
+	}
+
+	t.Run("should sample every trace at rate 1.0", func(t *testing.T) {
+		p := NewProbabilistic(1.0)
+		for _, v := range views {
+			d := p.Evaluate(v)
+			require.Equal(t, VerdictSample, d.Verdict,
+				"rate 1.0 must keep every trace on every architecture")
+			require.Equal(t, float64(1), d.Probability,
+				"a certain keep must report weight 1, never a rate it did not apply")
+		}
+	})
+
+	t.Run("should drop every trace at rate 0", func(t *testing.T) {
+		p := NewProbabilistic(0)
+		for _, v := range views {
+			require.Equal(t, VerdictDrop, p.Evaluate(v).Verdict)
+		}
+	})
+
+	t.Run("should keep a rate just below 1 overwhelmingly, not by half", func(t *testing.T) {
+		// The bug's signature is a threshold collapsing to 2^63, i.e. ~50%.
+		// 0.99 must land nowhere near that.
+		p := NewProbabilistic(0.99)
+		kept := 0
+		for _, v := range views {
+			if p.Evaluate(v).Verdict == VerdictSample {
+				kept++
+			}
+		}
+		require.Greater(t, kept, len(views)*90/100,
+			"rate 0.99 kept %d/%d -- a threshold collapsing to half looks exactly like this",
+			kept, len(views))
+	})
+
+	t.Run("should stay deterministic for the same trace id", func(t *testing.T) {
+		p := NewProbabilistic(0.05)
+		for _, v := range views[:32] {
+			first := p.Evaluate(v).Verdict
+			for i := 0; i < 5; i++ {
+				require.Equal(t, first, p.Evaluate(v).Verdict,
+					"sampling must be a pure function of trace_id, or a late span disagrees with its own trace")
+			}
+		}
+	})
+}
